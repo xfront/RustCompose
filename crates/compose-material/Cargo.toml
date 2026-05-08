@@ -1,0 +1,9 @@
+[package]
+name = "compose-material"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Material 3 widgets for compose — Jetpack Compose-style Rust GUI (text/surface/card/button/checkbox/switch/slider/text_field/scrollable_column)"
+
+[dependencies]
+compose = { path = "../compose" }

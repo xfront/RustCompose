@@ -1,0 +1,15 @@
+[package]
+name = "examples"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Standalone example apps for compose (kept out of backend crates)"
+publish = false
+
+[[example]]
+name = "story"
+path = "story.rs"
+
+[dependencies]
+compose = { path = "../crates/compose" }
+compose-material = { path = "../crates/compose-material" }

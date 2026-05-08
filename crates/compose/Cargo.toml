@@ -1,0 +1,40 @@
+[package]
+name = "compose"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "A cross-platform Rust GUI library with Jetpack Compose architecture (render-agnostic core + merged render/platform layers)"
+
+# 单一跨平台 crate：桌面=rlib、Android/iOS/OHOS=cdylib/staticlib（宿主 .so/.a）、Web=rlib。
+# 由构建目标（--target）决定实际产出类型，多余类型无害（承接原 compose-platform 的产物形态）。
+[lib]
+crate-type = ["rlib", "cdylib", "staticlib"]
+
+[dependencies]
+# ── 渲染层（原 compose-render）：valo 0.13 + wgpu 30 + winit 0.30 共享后端 ──
+log = "0.4"
+valo = "0.18"
+wgpu = "30"
+pollster = "1"
+winit = "0.30"
+raw-window-handle = "0.6"
+
+[dev-dependencies]
+compose-material = { path = "../compose-material" }
+
+# ── Web（wasm32-unknown-unknown + wasm-bindgen）：wgpu 浏览器后端 + wasm 宿主胶水 ──
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wgpu = { version = "30", features = ["webgpu", "webgl", "wgsl"] }
+wasm-bindgen = "0.2"
+web-sys = { version = "0.3", features = ["Window", "HtmlCanvasElement", "console"] }
+console_error_panic_hook = "0.1"
+
+# ── Android：ndk 提供 ANativeWindow 类型（gpu 层），android-activity 驱动事件循环 ──
+[target.'cfg(target_os = "android")'.dependencies]
+ndk = "0.9"
+android-activity = { version = "0.6", features = ["native-activity"] }
+
+# ── 桌面端平台能力真实后端（剪贴板 arboard / 文件对话框 rfd；仅桌面编译）──────────
+[target.'cfg(all(not(target_arch = "wasm32"), not(target_os = "android"), not(target_env = "ohos"), not(target_os = "ios")))'.dependencies]
+arboard = "3.7"
+rfd = "0.18"

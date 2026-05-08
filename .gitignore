@@ -1,0 +1,5 @@
+/.idea/
+*build*/
+target/
+.Trash*/
+/web_dist/

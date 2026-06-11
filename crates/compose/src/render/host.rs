@@ -244,7 +244,7 @@ mod winit_host {
                             let shift = KMOD_SHIFT.with(|s| s.get());
                             // 回报 Shift 状态给富文本选区逻辑
                             crate::input_router::shift(shift);
-                            // Ctrl 组合键优先于普通字符（复制/剪切/粘贴/全选）
+                            // Ctrl 组合键优先于普通字符（复制/剪切/粘贴/全选/撤销/重做）
                             if ctrl {
                                 if let winit::keyboard::Key::Character(ch) = &event.logical_key {
                                     match ch.to_lowercase().as_str() {
@@ -262,6 +262,18 @@ mod winit_host {
                                         }
                                         "a" => {
                                             crate::input_router::select_all();
+                                            st.window.request_redraw();
+                                        }
+                                        "z" => {
+                                            if shift {
+                                                crate::input_router::redo();
+                                            } else {
+                                                crate::input_router::undo();
+                                            }
+                                            st.window.request_redraw();
+                                        }
+                                        "y" => {
+                                            crate::input_router::redo();
                                             st.window.request_redraw();
                                         }
                                         _ => {}
@@ -306,6 +318,10 @@ mod winit_host {
                                     }
                                     winit::keyboard::Key::Named(winit::keyboard::NamedKey::Delete) => {
                                         kernel.key(NavKey::Delete);
+                                    }
+                                    winit::keyboard::Key::Named(winit::keyboard::NamedKey::F3) => {
+                                        crate::input_router::find_next();
+                                        st.window.request_redraw();
                                     }
                                     _ => {}
                                 }

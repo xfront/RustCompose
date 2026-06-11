@@ -125,6 +125,15 @@ impl Block {
     }
 }
 
+/// 撤销快照（整份文档 + 光标 + 选区）。
+#[derive(Clone)]
+struct EdSnap {
+    blocks: Vec<Block>,
+    cb: usize,
+    co: usize,
+    anchor: Option<(usize, usize)>,
+}
+
 /// 编辑器内部状态。
 pub struct EdState {
     pub blocks: Vec<Block>,
@@ -138,9 +147,22 @@ pub struct EdState {
     pub scroll: f32,
     /// 绘制时重建的布局缓存：(块索引, 文档 y 顶, 行高)，供点击命中。
     pub layout: Vec<(usize, f32, f32)>,
+    /// 撤销历史（每次编辑前压栈当前快照，清空重做栈）。
+    pub history: Vec<EdSnap>,
+    /// 重做栈。
+    pub future: Vec<EdSnap>,
+    /// 查找关键字（None = 未启用查找）。
+    pub find: Option<String>,
+    /// 查找命中区间：`(块索引, 起始字符偏移, 结束字符偏移)`。
+    pub find_matches: Vec<(usize, usize, usize)>,
+    /// 当前高亮的查找命中下标（F3 循环）。
+    pub find_idx: usize,
 }
 
 pub type Ed = Rc<RefCell<EdState>>;
+
+/// 撤销历史上限（防无限增长）。
+const HISTORY_LIMIT: usize = 200;
 
 impl EdState {
     pub fn new() -> Self {
@@ -152,6 +174,11 @@ impl EdState {
             pending: InlineFormat::default(),
             scroll: 0.0,
             layout: Vec::new(),
+            history: Vec::new(),
+            future: Vec::new(),
+            find: None,
+            find_matches: Vec::new(),
+            find_idx: 0,
         }
     }
 
@@ -215,6 +242,107 @@ fn has_selection(st: &EdState) -> bool {
 fn clamp_caret(st: &mut EdState) {
     st.cb = st.cb.min(st.blocks.len() - 1);
     st.co = st.co.min(block_len(&st.blocks[st.cb]));
+}
+
+/// 把当前状态压入撤销栈，并清空重做栈。每次「会改文档」的操作前调用一次。
+fn snapshot(st: &mut EdState) {
+    let snap = EdSnap {
+        blocks: st.blocks.clone(),
+        cb: st.cb,
+        co: st.co,
+        anchor: st.anchor,
+    };
+    if st.history.len() >= HISTORY_LIMIT {
+        st.history.remove(0);
+    }
+    st.history.push(snap);
+    st.future.clear();
+}
+
+/// 撤销一步（无历史则 no-op）。
+fn undo(st: &mut EdState) {
+    if let Some(s) = st.history.pop() {
+        let cur = EdSnap {
+            blocks: st.blocks.clone(),
+            cb: st.cb,
+            co: st.co,
+            anchor: st.anchor,
+        };
+        st.future.push(cur);
+        st.blocks = s.blocks;
+        st.cb = s.cb.min(st.blocks.len().saturating_sub(1));
+        st.co = s.co.min(block_len(&st.blocks[st.cb]));
+        st.anchor = None;
+        clamp_caret(st);
+    }
+}
+
+/// 重做一步（无重做栈则 no-op）。
+fn redo(st: &mut EdState) {
+    if let Some(s) = st.future.pop() {
+        let cur = EdSnap {
+            blocks: st.blocks.clone(),
+            cb: st.cb,
+            co: st.co,
+            anchor: st.anchor,
+        };
+        st.history.push(cur);
+        st.blocks = s.blocks;
+        st.cb = s.cb.min(st.blocks.len().saturating_sub(1));
+        st.co = s.co.min(block_len(&st.blocks[st.cb]));
+        st.anchor = None;
+        clamp_caret(st);
+    }
+}
+
+/// 根据当前关键字（若有）重建查找到的命中区间（纯派生缓存，幂等）。
+fn recompute_find(st: &mut EdState) {
+    st.find_matches.clear();
+    if let Some(q) = &st.find {
+        if q.is_empty() {
+            return;
+        }
+        let qc: Vec<char> = q.chars().collect();
+        for (bi, blk) in st.blocks.iter().enumerate() {
+            let t: Vec<char> = blk.flat_text().chars().collect();
+            if t.len() < qc.len() {
+                continue;
+            }
+            for i in 0..=t.len() - qc.len() {
+                if &t[i..i + qc.len()] == qc.as_slice() {
+                    st.find_matches.push((bi, i, i + qc.len()));
+                }
+            }
+        }
+    }
+}
+
+/// 设置查找关键字并跳到首个命中（空串关闭查找）。
+fn set_find(st: &mut EdState, q: &str) {
+    st.find = if q.is_empty() { None } else { Some(q.to_string()) };
+    st.find_idx = 0;
+    recompute_find(st);
+    if let Some(&(bi, s, _)) = st.find_matches.first() {
+        st.cb = bi;
+        st.co = s;
+        st.anchor = None;
+        st.scroll = 0.0;
+        clamp_caret(st);
+    }
+}
+
+/// 跳到下一个查找命中（F3）。无命中则 no-op。
+fn find_next(st: &mut EdState) {
+    if st.find_matches.is_empty() {
+        return;
+    }
+    st.find_idx = (st.find_idx + 1) % st.find_matches.len();
+    let (bi, s, _) = st.find_matches[st.find_idx];
+    st.cb = bi;
+    st.co = s;
+    st.anchor = None;
+    st.scroll = 0.0;
+    clamp_caret(st);
 }
 
 /// 在块的 `off` 处插入文本，相邻同格式 run 合并。
@@ -733,6 +861,13 @@ pub fn parse_html(html: &str) -> Vec<Block> {
                             fmts.pop();
                         }
                     }
+                    // 行内格式闭合标签（与下方开标签配对，弹出一层格式栈）
+                    "b" | "strong" | "i" | "em" | "u" | "s" | "del" | "strike" | "code" => {
+                        flush_text!();
+                        if fmts.len() > 1 {
+                            fmts.pop();
+                        }
+                    }
                     _ => {}
                 }
             } else {
@@ -804,6 +939,37 @@ pub fn parse_html(html: &str) -> Vec<Block> {
                         }
                         fmts.push(f);
                     }
+                    // 行内格式开标签：压入一层继承自当前上下文的格式
+                    "b" | "strong" => {
+                        flush_text!();
+                        let mut f = fmts.last().cloned().unwrap_or_default();
+                        f.bold = true;
+                        fmts.push(f);
+                    }
+                    "i" | "em" => {
+                        flush_text!();
+                        let mut f = fmts.last().cloned().unwrap_or_default();
+                        f.italic = true;
+                        fmts.push(f);
+                    }
+                    "u" => {
+                        flush_text!();
+                        let mut f = fmts.last().cloned().unwrap_or_default();
+                        f.underline = true;
+                        fmts.push(f);
+                    }
+                    "s" | "del" | "strike" => {
+                        flush_text!();
+                        let mut f = fmts.last().cloned().unwrap_or_default();
+                        f.strikethrough = true;
+                        fmts.push(f);
+                    }
+                    "code" => {
+                        flush_text!();
+                        let mut f = fmts.last().cloned().unwrap_or_default();
+                        f.code = true;
+                        fmts.push(f);
+                    }
                     _ => {}
                 }
             }
@@ -822,6 +988,152 @@ pub fn parse_html(html: &str) -> Vec<Block> {
         blocks.push(Block::new());
     }
     blocks
+}
+
+// ── 导出（HTML / Markdown） ──────────────────────────────────────────────────────
+
+fn escape_html(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// 单个 run 序列化为 HTML 片段（内层格式化标签按外层到内层包裹）。
+fn runs_to_html(runs: &[TextRun]) -> String {
+    runs.iter()
+        .map(|r| {
+            let mut inner = escape_html(&r.text);
+            if let Some(link) = &r.fmt.link {
+                inner = format!("<a href=\"{}\">{}</a>", link, inner);
+            }
+            if r.fmt.bold {
+                inner = format!("<b>{inner}</b>");
+            }
+            if r.fmt.italic {
+                inner = format!("<i>{inner}</i>");
+            }
+            if r.fmt.underline {
+                inner = format!("<u>{inner}</u>");
+            }
+            if r.fmt.strikethrough {
+                inner = format!("<s>{inner}</s>");
+            }
+            if r.fmt.code {
+                inner = format!("<code>{inner}</code>");
+            }
+            if let Some(c) = r.fmt.color {
+                let hex = format!(
+                    "#{:02x}{:02x}{:02x}",
+                    (c.r * 255.0) as u8,
+                    (c.g * 255.0) as u8,
+                    (c.b * 255.0) as u8
+                );
+                inner = format!("<span style=\"color:{hex}\">{inner}</span>");
+            }
+            inner
+        })
+        .collect()
+}
+
+/// 整份文档导出为 HTML（相邻同类型列表项合并为单个 `<ul>`/`<ol>`）。
+pub fn to_html(blocks: &[Block]) -> String {
+    let mut out = String::new();
+    let mut i = 0;
+    while i < blocks.len() {
+        let bt = blocks[i].block_type;
+        match bt {
+            BlockType::OrderedList | BlockType::UnorderedList | BlockType::CheckList => {
+                let tag = if bt == BlockType::OrderedList {
+                    "ol"
+                } else {
+                    "ul"
+                };
+                out.push_str(&format!("<{tag}>"));
+                while i < blocks.len() && blocks[i].block_type == bt {
+                    let b = &blocks[i];
+                    let cb = if b.block_type == BlockType::CheckList {
+                        format!(
+                            "<input type=\"checkbox\"{}> ",
+                            if b.checked { " checked" } else { "" }
+                        )
+                    } else {
+                        String::new()
+                    };
+                    let inner: String = runs_to_html(&b.runs);
+                    out.push_str(&format!("<li>{cb}{inner}</li>"));
+                    i += 1;
+                }
+                out.push_str(&format!("</{tag}>\n"));
+            }
+            _ => {
+                let tag = match bt {
+                    BlockType::H1 => "h1",
+                    BlockType::H2 => "h2",
+                    BlockType::H3 => "h3",
+                    BlockType::Blockquote => "blockquote",
+                    BlockType::CodeBlock => "pre",
+                    _ => "p",
+                };
+                let inner: String = runs_to_html(&blocks[i].runs);
+                out.push_str(&format!("<{tag}>{inner}</{tag}>\n"));
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+fn run_to_md(r: &TextRun) -> String {
+    let mut s = r.text.clone();
+    if r.fmt.code {
+        s = format!("`{s}`");
+    }
+    if r.fmt.bold {
+        s = format!("**{s}**");
+    }
+    if r.fmt.italic {
+        s = format!("*{s}*");
+    }
+    if r.fmt.strikethrough {
+        s = format!("~~{s}~~");
+    }
+    if let Some(link) = &r.fmt.link {
+        s = format!("[{s}]({link})");
+    }
+    s
+}
+
+/// 整份文档导出为 Markdown。
+pub fn to_markdown(blocks: &[Block]) -> String {
+    let mut out = String::new();
+    for b in blocks {
+        let inner: String = if b.block_type == BlockType::CodeBlock {
+            b.flat_text()
+        } else {
+            b.runs.iter().map(run_to_md).collect()
+        };
+        let line = match b.block_type {
+            BlockType::H1 => format!("# {inner}"),
+            BlockType::H2 => format!("## {inner}"),
+            BlockType::H3 => format!("### {inner}"),
+            BlockType::Blockquote => format!("> {inner}"),
+            BlockType::UnorderedList => format!("- {inner}"),
+            BlockType::OrderedList => format!("1. {inner}"),
+            BlockType::CheckList => {
+                if b.checked {
+                    format!("- [x] {inner}")
+                } else {
+                    format!("- [ ] {inner}")
+                }
+            }
+            BlockType::CodeBlock => format!("```\n{inner}\n```"),
+            _ => inner,
+        };
+        out.push_str(&line);
+        out.push_str("\n\n");
+    }
+    out
 }
 
 // ── 焦点与平台事件路由（input.rs 各入口优先调用） ────────────────────────────
@@ -847,36 +1159,52 @@ pub fn rich_editor_blur() {
     RICH_ED_FOCUS.with(|f| *f.borrow_mut() = None);
 }
 
-fn focus(ed: Ed) {
+/// 将某个 `RichTextEditor` 实例设为键盘输入焦点（平台路由据此分发字符/键）。
+pub fn rich_editor_focus(ed: Ed) {
     RICH_ED_FOCUS.with(|f| *f.borrow_mut() = Some(ed));
 }
 
 /// 字符输入（平台路由）。
 pub fn rich_char(c: char) {
-    with_ed(|s| insert_text(s, &c.to_string()));
+    with_ed(|s| {
+        snapshot(s);
+        insert_text(s, &c.to_string());
+    });
 }
 
 /// 退格。
 pub fn rich_backspace() {
-    with_ed(backspace);
+    with_ed(|s| {
+        snapshot(s);
+        backspace(s);
+    });
 }
 
 /// 导航键（含 Delete）。
 pub fn rich_key(key: NavKey) {
     with_ed(|s| match key {
-        NavKey::Delete => delete_key(s),
+        NavKey::Delete => {
+            snapshot(s);
+            delete_key(s);
+        }
         _ => move_key(s, key, shift_held()),
     });
 }
 
 /// 回车（换行 / 拆块 / 退出列表）。
 pub fn rich_enter() {
-    with_ed(enter);
+    with_ed(|s| {
+        snapshot(s);
+        enter(s);
+    });
 }
 
 /// IME 提交。
 pub fn rich_commit(s: &str) {
-    with_ed(move |st| insert_text(st, s));
+    with_ed(move |st| {
+        snapshot(st);
+        insert_text(st, s);
+    });
 }
 
 /// 复制选区。
@@ -894,6 +1222,7 @@ pub fn rich_cut() {
     with_ed(|s| {
         let t = copy_sel(s);
         if !t.is_empty() {
+            snapshot(s);
             clipboard_set(&t);
             delete_sel(s);
         }
@@ -904,13 +1233,36 @@ pub fn rich_cut() {
 pub fn rich_paste() {
     let t = clipboard_get();
     if !t.is_empty() {
-        with_ed(move |s| insert_text(s, &t));
+        with_ed(move |s| {
+            snapshot(s);
+            insert_text(s, &t);
+        });
     }
 }
 
 /// 全选。
 pub fn rich_select_all() {
     with_ed(select_all);
+}
+
+/// 撤销（Ctrl+Z）。
+pub fn rich_undo() {
+    with_ed(undo);
+}
+
+/// 重做（Ctrl+Y / Ctrl+Shift+Z）。
+pub fn rich_redo() {
+    with_ed(redo);
+}
+
+/// 设置查找关键字（空串关闭）。
+pub fn rich_find_set(q: &str) {
+    with_ed(|s| set_find(s, q));
+}
+
+/// 跳到下一个查找命中（F3）。
+pub fn rich_find_next() {
+    with_ed(find_next);
 }
 
 /// 滚轮（聚焦编辑器滚动；越界由 draw 夹取）。
@@ -1062,6 +1414,8 @@ fn draw_editor(
     let max_scroll = (content_h - h).max(0.0);
     st.scroll = st.scroll.clamp(0.0, max_scroll);
     let scroll = st.scroll;
+    // 查找命中随文本变化，每帧据当前文档重建（幂等、开销小）。
+    recompute_find(st);
 
     let ((ssb, sso), (seb, seo)) = sel_range(st);
     let has_sel = (ssb, sso) != (seb, seo);
@@ -1153,10 +1507,39 @@ fn draw_editor(
         // runs
         let mut cx = base_x;
         let mut col0 = 0usize;
+        // 本块命中的查找区间（用于黄色高亮）
+        let block_matches: Vec<(usize, usize)> = st
+            .find_matches
+            .iter()
+            .filter(|(bi, _, _)| *bi == i)
+            .map(|(_, s, e)| (*s, *e))
+            .collect();
         for r in &blk.runs {
             let len = r.text.chars().count();
             let rstyle = run_style(r, bt, size, ec);
             let rw = measure_text_with_measurer(&r.text, &rstyle).0;
+            // 查找命中高亮（与本 run 的交集；当前命中用更强底色）
+            for &(ms, me) in &block_matches {
+                let os = ms.max(col0).saturating_sub(col0);
+                let oe = me.min(col0 + len).saturating_sub(col0);
+                if oe > os {
+                    let x1 = cx + run_px(r, bt, size, ec, os);
+                    let x2 = cx + run_px(r, bt, size, ec, oe);
+                    let is_cur = st.find_idx < st.find_matches.len()
+                        && st.find_matches[st.find_idx] == (i, ms, me);
+                    b.fill_rect(
+                        x1,
+                        ly,
+                        (x2 - x1).max(1.0),
+                        lh,
+                        if is_cur {
+                            ec.secondary.with_alpha(0.45)
+                        } else {
+                            ec.secondary.with_alpha(0.22)
+                        },
+                    );
+                }
+            }
             // 选区高亮（与本 run 的交集）
             if has_sel && i >= ssb && i <= seb {
                 let s_off = if i == ssb { sso } else { 0 };
@@ -1238,6 +1621,7 @@ fn click_to_caret(st: &mut EdState, lx: f32, ly: f32, ec: &EdColors) {
     }
     let bt = st.blocks[target].block_type;
     if bt == BlockType::CheckList && lx >= PAD_L + 2.0 && lx <= PAD_L + 22.0 {
+        snapshot(st);
         st.blocks[target].checked = !st.blocks[target].checked;
         return;
     }
@@ -1250,11 +1634,14 @@ fn click_to_caret(st: &mut EdState, lx: f32, ly: f32, ec: &EdColors) {
 
 // ── 工具栏 ──────────────────────────────────────────────────────────────────
 
+/// 工具栏按钮。`snap = true` 表示动作会改文档（先压撤销快照）；
+/// `snap = false` 用于撤销/重做等历史操作（再压快照会抵消自身效果）。
 fn tbtn(
     label: &str,
     active: bool,
     rev: MutableState<u32>,
     ed: &Ed,
+    snap: bool,
     action: impl Fn(&mut EdState) + 'static,
 ) {
     let label = label.to_string();
@@ -1266,7 +1653,12 @@ fn tbtn(
     );
     with_rt_pub(|rt| {
         rt.nodes[id.index()].on_click = Some(Box::new(move || {
-            action(&mut ed.borrow_mut());
+            let mut st = ed.borrow_mut();
+            if snap {
+                snapshot(&mut st);
+            }
+            action(&mut st);
+            drop(st);
             rev.update(|v| *v += 1);
         }));
         rt.nodes[id.index()].draw = Some(Box::new(move |b: &mut DrawBuilder, x, y, w, h| {
@@ -1299,46 +1691,51 @@ fn toolbar_row(ed: &Ed, rev: MutableState<u32>) {
                 let s = ed2.borrow();
                 (s.current_bt(), s.pending.clone())
             };
-            tbtn("¶", cur == BlockType::Paragraph, rev, &ed2, |s| {
+            tbtn("¶", cur == BlockType::Paragraph, rev, &ed2, true, |s| {
                 toggle_block(s, BlockType::Paragraph)
             });
-            tbtn("H1", cur == BlockType::H1, rev, &ed2, |s| {
+            tbtn("H1", cur == BlockType::H1, rev, &ed2, true, |s| {
                 toggle_block(s, BlockType::H1)
             });
-            tbtn("H2", cur == BlockType::H2, rev, &ed2, |s| {
+            tbtn("H2", cur == BlockType::H2, rev, &ed2, true, |s| {
                 toggle_block(s, BlockType::H2)
             });
-            tbtn("H3", cur == BlockType::H3, rev, &ed2, |s| {
+            tbtn("H3", cur == BlockType::H3, rev, &ed2, true, |s| {
                 toggle_block(s, BlockType::H3)
             });
-            tbtn("B", pend.bold, rev, &ed2, |s| {
+            tbtn("B", pend.bold, rev, &ed2, true, |s| {
                 toggle_inline(s, FmtToggle::Bold)
             });
-            tbtn("I", pend.italic, rev, &ed2, |s| {
+            tbtn("I", pend.italic, rev, &ed2, true, |s| {
                 toggle_inline(s, FmtToggle::Italic)
             });
-            tbtn("U", pend.underline, rev, &ed2, |s| {
+            tbtn("U", pend.underline, rev, &ed2, true, |s| {
                 toggle_inline(s, FmtToggle::Underline)
             });
-            tbtn("S", pend.strikethrough, rev, &ed2, |s| {
+            tbtn("S", pend.strikethrough, rev, &ed2, true, |s| {
                 toggle_inline(s, FmtToggle::Strikethrough)
             });
-            tbtn("</>", pend.code, rev, &ed2, |s| {
+            tbtn("</>", pend.code, rev, &ed2, true, |s| {
                 toggle_inline(s, FmtToggle::Code)
             });
-            tbtn("❝", cur == BlockType::Blockquote, rev, &ed2, |s| {
+            tbtn("❝", cur == BlockType::Blockquote, rev, &ed2, true, |s| {
                 toggle_block(s, BlockType::Blockquote)
             });
-            tbtn("UL", cur == BlockType::UnorderedList, rev, &ed2, |s| {
+            tbtn("UL", cur == BlockType::UnorderedList, rev, &ed2, true, |s| {
                 toggle_block(s, BlockType::UnorderedList)
             });
-            tbtn("OL", cur == BlockType::OrderedList, rev, &ed2, |s| {
+            tbtn("OL", cur == BlockType::OrderedList, rev, &ed2, true, |s| {
                 toggle_block(s, BlockType::OrderedList)
             });
-            tbtn("☑", cur == BlockType::CheckList, rev, &ed2, |s| {
+            tbtn("☑", cur == BlockType::CheckList, rev, &ed2, true, |s| {
                 toggle_block(s, BlockType::CheckList)
             });
-            tbtn("⌫F", false, rev, &ed2, clear_format);
+            tbtn("⌫F", false, rev, &ed2, true, clear_format);
+            // 撤销 / 重做（带可用态高亮）
+            let can_undo = ed2.borrow().history.is_empty();
+            let can_redo = ed2.borrow().future.is_empty();
+            tbtn("↶", !can_undo, rev, &ed2, false, |s| undo(s));
+            tbtn("↷", !can_redo, rev, &ed2, false, |s| redo(s));
         },
     );
 }
@@ -1359,13 +1756,26 @@ impl RichTextEditorHandle {
 
     /// 导入 HTML（`set_html`）。
     pub fn set_html(&self, html: &str) {
-        *self.ed.borrow_mut() = EdState::from_blocks(parse_html(html));
+        let mut st = self.ed.borrow_mut();
+        snapshot(&mut st);
+        st.blocks = parse_html(html);
+        if st.blocks.is_empty() {
+            st.blocks.push(Block::new());
+        }
+        drop(st);
         self.bump();
     }
 
     /// 直接替换文档块。
     pub fn set_blocks(&self, blocks: Vec<Block>) {
-        *self.ed.borrow_mut() = EdState::from_blocks(blocks);
+        let mut st = self.ed.borrow_mut();
+        snapshot(&mut st);
+        st.blocks = if blocks.is_empty() {
+            vec![Block::new()]
+        } else {
+            blocks
+        };
+        drop(st);
         self.bump();
     }
 
@@ -1392,6 +1802,57 @@ impl RichTextEditorHandle {
             .iter()
             .map(|b| b.flat_text().chars().count())
             .sum()
+    }
+
+    /// 导出为 HTML。
+    pub fn to_html(&self) -> String {
+        to_html(&self.ed.borrow().blocks)
+    }
+
+    /// 导出为 Markdown。
+    pub fn to_markdown(&self) -> String {
+        to_markdown(&self.ed.borrow().blocks)
+    }
+
+    /// 撤销一步（等价于 Ctrl+Z）。注意：撤销本身不入历史，故不走 `with`。
+    pub fn undo(&self) {
+        let mut st = self.ed.borrow_mut();
+        undo(&mut st);
+        drop(st);
+        self.bump();
+    }
+    /// 重做一步（等价于 Ctrl+Y / Ctrl+Shift+Z）。注意：重做本身不入历史。
+    pub fn redo(&self) {
+        let mut st = self.ed.borrow_mut();
+        redo(&mut st);
+        drop(st);
+        self.bump();
+    }
+    /// 是否有可撤销步骤。
+    pub fn can_undo(&self) -> bool {
+        !self.ed.borrow().history.is_empty()
+    }
+    /// 是否有可重做步骤。
+    pub fn can_redo(&self) -> bool {
+        !self.ed.borrow().future.is_empty()
+    }
+    /// 设置查找关键字（空串关闭查找）。不影响撤销历史。
+    pub fn set_find(&self, query: &str) {
+        let mut st = self.ed.borrow_mut();
+        set_find(&mut st, query);
+        drop(st);
+        self.bump();
+    }
+    /// 跳到下一个查找命中（等价于 F3）。不影响撤销历史。
+    pub fn find_next(&self) {
+        let mut st = self.ed.borrow_mut();
+        find_next(&mut st);
+        drop(st);
+        self.bump();
+    }
+    /// 当前查找命中数（0 = 无）。
+    pub fn find_match_count(&self) -> usize {
+        self.ed.borrow().find_matches.len()
     }
 
     pub fn toggle_bold(&self) {
@@ -1432,7 +1893,10 @@ impl RichTextEditorHandle {
     }
 
     fn with(&self, f: impl FnOnce(&mut EdState)) {
-        f(&mut self.ed.borrow_mut());
+        let mut st = self.ed.borrow_mut();
+        snapshot(&mut st);
+        f(&mut st);
+        drop(st);
         self.bump();
     }
 }
@@ -1468,13 +1932,14 @@ pub fn RichTextEditor(modifier: Modifier) -> RichTextEditorHandle {
             let ed_click = ed_col.clone();
             let ed_draw = ed_col.clone();
             with_rt_pub(|rt| {
+                // 点击回调在组合外执行（作用域栈为空），不能再调 `theme_colors()`；
+                // 直接复用组合期捕获的 `ec` 快照（`EdColors: Copy`，两个闭包各自复制）。
                 rt.nodes[id.index()].on_click = Some(Box::new(move || {
-                    focus(ed_click.clone());
                     blur_fields();
+                    rich_editor_focus(ed_click.clone());
                     preedit_reset();
                     let (lx, ly) = last_click_local();
-                    let ec2 = EdColors::capture();
-                    click_to_caret(&mut ed_click.borrow_mut(), lx, ly, &ec2);
+                    click_to_caret(&mut ed_click.borrow_mut(), lx, ly, &ec);
                 }));
                 rt.nodes[id.index()].draw =
                     Some(Box::new(move |b: &mut DrawBuilder, x, y, w, h| {

@@ -5,11 +5,15 @@ edition.workspace = true
 license.workspace = true
 description = "Standalone example apps for compose (kept out of backend crates)"
 publish = false
+# example 手动声明（story 入口位于 story/ 子目录），关闭自动发现避免重复目标。
+autoexamples = false
 
 [[example]]
 name = "story"
-path = "story.rs"
+path = "story/main.rs"
 
 [dependencies]
 compose = { path = "../crates/compose" }
 compose-material = { path = "../crates/compose-material" }
+# story 演示用：程序生成一张测试 PNG 字节，喂给 `Image` 控件走完整「解码 → 上传 → 绘制」管线。
+image = { version = "0.25", default-features = false, features = ["png", "bmp"] }

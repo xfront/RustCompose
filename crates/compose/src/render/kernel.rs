@@ -32,6 +32,7 @@ use crate::render::display_list::{
     build_cmds_display_list, build_display_list, new_frame_builder, record_cmds, TextContext,
 };
 use crate::render::gpu::GpuRenderer;
+use crate::render::image_cache;
 
 /// 用户应用 trait — 对齐 Compose `setContent { content }`。
 /// 从 compose-desktop 上移至此，供全部平台 crate 共享。
@@ -256,6 +257,12 @@ impl Kernel {
         set_viewport(width, height);
         let t0 = Instant::now();
         advance_frame(delta);
+        // 取回解码线程投递进来的位图像素（INBOX → pending），让本帧 recompose 使 `Image`
+        // 控件的 token 翻转、进而让保留模式静态块缓存失效并重绘。
+        let _ = image_cache::consume_decoded();
+        // 排空主线程任务队列（后台线程投递的文件对话框等结果回调），在重组前执行，
+        // 使回调里的 `MutableState::set` 能在同帧触发定向重组（此时运行时 RefCell 借用尚未建立）。
+        crate::runtime::drain_main_tasks();
         Recomposer::recompose_pending();
         let t1 = Instant::now();
 
@@ -270,7 +277,11 @@ impl Kernel {
         // 4) 增量脏区绘制。
         // 快路径①：画面已 settled（根无失效标记 = 本轮无重组 / 几何 / 滚动脏）且尺寸未变 →
         // 与上一帧逐命令相同 → 跳过整树绘制遍历、DisplayList 重建与 GPU 上传（空闲帧近乎零成本）。
-        if self.has_rendered && size_unchanged && compose::layout::scene_is_clean(root) {
+        if self.has_rendered
+            && size_unchanged
+            && compose::layout::scene_is_clean(root)
+            && !image_cache::pending_nonempty()
+        {
             let busy = compose::animation::animations_active() || Recomposer::has_pending();
             trace_frame(FrameSample {
                 path: 0,
@@ -320,6 +331,7 @@ impl Kernel {
             && size_unchanged
             && !compose::layout::scene_changed()
             && !frame_draw.static_changed
+            && !image_cache::pending_nonempty()
         {
             self.last_w = width;
             self.last_h = height;
@@ -342,6 +354,9 @@ impl Kernel {
         let mut build_ms = 0.0f32;
         let mut gpu_ms = 0.0f32;
         let dyn_count = frame_draw.dynamic_cmds.len();
+        // 把待上传的 CPU 像素上传为 GPU 纹理（按 image_id 缓存复用），随后 build 时
+        // `record_cmds` 通过 `get_uploaded` 取得句柄绘制。
+        image_cache::upload_phase(renderer);
         TEXT_CTX.with(|cell| {
             let mut b = cell.borrow_mut();
             let Some(tc) = b.as_mut() else { return };

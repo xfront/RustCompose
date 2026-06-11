@@ -19,6 +19,13 @@ use compose::runtime::{
 
 use crate::tokens;
 use crate::widgets::overlay::RememberOverlayKey;
+// Quill 富文本编辑器的路由入口（与 RichTextEdit 内部的 rich_* 重名，故别名 rte_*）。
+use crate::widgets::rich_text_editor::{
+    rich_backspace as rte_backspace, rich_char, rich_commit, rich_copy as rte_copy,
+    rich_cut as rte_cut, rich_editor_blur, rich_editor_focused, rich_enter,
+    rich_find_next, rich_key as rte_key, rich_paste as rte_paste, rich_redo, rich_scroll,
+    rich_select_all as rte_select_all, rich_undo,
+};
 use crate::widgets::{GlassOrBg, Overlay, RotatingChevron, Text, VerticalScroll};
 
 // ══════════════════════════════ TextField 焦点 ══════════════════════════════
@@ -127,6 +134,10 @@ fn caret_index_at(text: &str, dx: f32) -> usize {
 
 /// 平台键盘字符输入 → 聚焦的 TextField（OTP 为定位写入）。
 pub fn InputChar(ch: char) {
+    if rich_editor_focused() {
+        rich_char(ch);
+        return;
+    }
     if let Some(st) = FOCUSED_RICH.with(|f| f.get()) {
         rich_insert_char(st, ch);
         return;
@@ -166,6 +177,10 @@ pub fn InputChar(ch: char) {
 
 /// 平台退格（OTP 删除选中位；光标在末尾时删除前一位）。
 pub fn InputBackspace() {
+    if rich_editor_focused() {
+        rte_backspace();
+        return;
+    }
     if let Some(st) = FOCUSED_RICH.with(|f| f.get()) {
         rich_backspace_char(st);
         return;
@@ -213,6 +228,11 @@ pub fn InputBackspace() {
 
 /// 平台导航键 → 聚焦的 OTP 左右移动光标（其余键忽略，不影响列表等 scope 导航）。
 pub fn InputKey(key: NavKey) {
+    // Quill 富文本编辑器：完整方向键 / 选区 / Home/End/Delete
+    if rich_editor_focused() {
+        rte_key(key);
+        return;
+    }
     // 富文本：完整方向键 / 选区 / Home/End/Delete
     if let Some(st) = FOCUSED_RICH.with(|f| f.get()) {
         rich_key(st, key);
@@ -272,6 +292,10 @@ pub fn InputKey(key: NavKey) {
 
 /// 平台 IME 提交文本 → 聚焦 TextField（整段写入，并清除候选 preedit）。
 pub fn InputCommit(s: &str) {
+    if rich_editor_focused() {
+        rich_commit(s);
+        return;
+    }
     if let Some(st) = FOCUSED_RICH.with(|f| f.get()) {
         rich_insert_text(st, s);
         return;
@@ -1556,7 +1580,7 @@ pub fn FloatingMenu(
     menu_panel(key, anchor, items);
 }
 
-/// `DropdownMenu(anchor, key, items, expanded, onSelected, match_width)` — 由 `expanded` 控制开关的浮层菜单。
+/// `DropdownMenu(anchor, key, items, expanded, match_width, onSelected)` — 由 `expanded` 控制开关的浮层菜单。
 ///
 /// `match_width`：`true` 面板宽对齐锚点（下拉框）；`false` 按内容自然宽（TabRow 溢出「⋮」）。
 pub fn DropdownMenu(
@@ -1564,8 +1588,8 @@ pub fn DropdownMenu(
     key: u64,
     items: &[String],
     expanded: MutableState<bool>,
-    on_selected: impl FnMut(usize) + 'static,
     match_width: bool,
+    on_selected: impl FnMut(usize) + 'static,
 ) {
     put_menu_cb(key, on_selected);
     set_menu_close(key, move || expanded.set(false));
@@ -1647,7 +1671,7 @@ pub fn Dropdown(options: &[String], selected: MutableState<usize>, modifier: Mod
         );
     });
 
-    DropdownMenu(trigger, key, &opts, open, move |i| selected.set(i), true);
+    DropdownMenu(trigger, key, &opts, open, true, move |i| selected.set(i));
 }
 
 /// `ComboBox(options, selected)` — 可搜索下拉（内联过滤列表）。
@@ -1736,7 +1760,7 @@ pub fn PopupMenuButton(
             ),
         );
     });
-    DropdownMenu(trigger, key, items, expanded, on_selected, true);
+    DropdownMenu(trigger, key, items, expanded, true, on_selected);
 }
 
 /// `ContextMenu(items, onSelected) { content }` — **右键**点击内容弹出菜单。
@@ -1760,7 +1784,7 @@ pub fn ContextMenu(
         n.on_secondary_click = Some(Box::new(move || expanded.set(true)));
     });
     with_content_scope(id, content);
-    DropdownMenu(id, key, items, expanded, on_selected, true);
+    DropdownMenu(id, key, items, expanded, true, on_selected);
 }
 
 // ══════════════════════════════ 复合输入 ══════════════════════════════
@@ -2567,6 +2591,10 @@ fn rich_select_all_field(st: MutableState<String>) {
 
 /// 回车：在光标处插入换行（替换选区）。
 pub fn InputEnter() {
+    if rich_editor_focused() {
+        rich_enter();
+        return;
+    }
     if let Some(st) = FOCUSED_RICH.with(|f| f.get()) {
         rich_insert_text(st, "\n");
     }
@@ -2574,6 +2602,10 @@ pub fn InputEnter() {
 
 /// Ctrl+C：复制选区到剪贴板。
 pub fn InputCopy() {
+    if rich_editor_focused() {
+        rte_copy();
+        return;
+    }
     if let Some(st) = FOCUSED_RICH.with(|f| f.get()) {
         rich_copy_to_clipboard(st);
     }
@@ -2581,6 +2613,10 @@ pub fn InputCopy() {
 
 /// Ctrl+X：剪切选区到剪贴板。
 pub fn InputCut() {
+    if rich_editor_focused() {
+        rte_cut();
+        return;
+    }
     if let Some(st) = FOCUSED_RICH.with(|f| f.get()) {
         rich_cut_to_clipboard(st);
     }
@@ -2588,6 +2624,10 @@ pub fn InputCut() {
 
 /// Ctrl+V：从剪贴板粘贴（替换选区，支持多行）。
 pub fn InputPaste() {
+    if rich_editor_focused() {
+        rte_paste();
+        return;
+    }
     if let Some(st) = FOCUSED_RICH.with(|f| f.get()) {
         rich_paste_from_clipboard(st);
     }
@@ -2595,8 +2635,33 @@ pub fn InputPaste() {
 
 /// Ctrl+A：全选。
 pub fn InputSelectAll() {
+    if rich_editor_focused() {
+        rte_select_all();
+        return;
+    }
     if let Some(st) = FOCUSED_RICH.with(|f| f.get()) {
         rich_select_all_field(st);
+    }
+}
+
+/// Ctrl+Z：撤销。
+pub fn InputUndo() {
+    if rich_editor_focused() {
+        rich_undo();
+    }
+}
+
+/// Ctrl+Y / Ctrl+Shift+Z：重做。
+pub fn InputRedo() {
+    if rich_editor_focused() {
+        rich_redo();
+    }
+}
+
+/// F3：查找下一个命中。
+pub fn InputFindNext() {
+    if rich_editor_focused() {
+        rich_find_next();
     }
 }
 
@@ -2607,10 +2672,11 @@ pub fn SetShiftState(shift: bool) {
 
 // ── 供 `rich_text_editor` 模块复用的焦点 / 剪贴板 / IME 辅助（pub(crate)） ──
 
-/// 清空所有输入焦点（普通 TextField + RichTextEdit + IME 合成），用于点击富文本框时让其他输入框失焦。
+/// 清空所有输入焦点（普通 TextField + RichTextEdit + Quill 富文本编辑器 + IME 合成）。
 pub(crate) fn blur_fields() {
     set_field_focus(None);
     FOCUSED_RICH.with(|r| r.set(None));
+    rich_editor_blur();
     PREEDIT.with(|p| p.borrow_mut().clear());
 }
 
@@ -2621,6 +2687,11 @@ pub(crate) fn clipboard_get() -> String {
 
 /// 写入线程局部剪贴板。
 pub(crate) fn clipboard_set(s: &str) {
+    CLIPBOARD.with(|c| *c.borrow_mut() = s.to_string());
+}
+
+/// 公开：将文本写入线程局部剪贴板（供程序化「复制」按钮等使用）。
+pub fn copy_text(s: &str) {
     CLIPBOARD.with(|c| *c.borrow_mut() = s.to_string());
 }
 
@@ -2642,6 +2713,10 @@ pub(crate) fn shift_held() -> bool {
 /// 滚轮：调整当前聚焦 RichTextEdit 的垂直滚动偏移（像素，向下为正）。
 /// 仅作用于已聚焦的多行编辑器（与单行 TextField 的 scope 滚动互不干扰）。
 pub fn InputScroll(dy_px: f32) {
+    if rich_editor_focused() {
+        rich_scroll(dy_px);
+        return;
+    }
     if let Some(st) = FOCUSED_RICH.with(|f| f.get()) {
         if let Some(cell) = RICHTEXT_SCROLL.with(|m| m.borrow().get(&state_id(st)).cloned()) {
             cell.set(cell.get() + dy_px);

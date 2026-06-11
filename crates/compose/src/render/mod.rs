@@ -15,6 +15,7 @@
 //! 等平台能力）见 [`crate::platform`]，只负责「取原生窗口 + 事件泵」，复用本后端。
 
 mod display_list;
+pub mod image_cache;
 mod gpu;
 pub mod kernel;
 pub mod host;

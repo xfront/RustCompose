@@ -18,12 +18,17 @@ pub mod animation;
 pub mod basic;
 pub mod chart;
 pub mod data;
+pub mod dock_layout;
+pub mod dock_model;
+pub mod docking;
 pub mod feedback;
 pub mod glass;
 pub mod grid_sheet;
 pub mod input;
 pub mod layout;
 pub mod navigation;
+pub mod file_dialog;
+pub mod image;
 pub mod overlay;
 pub mod rich_text_editor;
 
@@ -167,10 +172,13 @@ pub use animation::{
 pub use basic::{
     AssistChip, Avatar, AvatarGroup, Badge, BadgedBox, Button, ButtonEx, ButtonOpts, ButtonVariant,
     Card, CenteredText, Chip, Divider, ElevatedButton, ElevatedCard, ExpandableFab, ExtendedFab,
-    Fab, FilledButton, FilledCard, FilterChip, GroupBox, IconButton, ImagePlaceholder, InkWell,
+    Fab, FabEx, FabExpandType, FabSize, FilledButton, FilledCard, FilterChip, GroupBox, IconButton,
+    ImagePlaceholder, InkWell,
     InkWellR, Kbd, Link, OutlinedButton, OutlinedCard, SearchBar, StatusDot, Surface, TextButton,
     TonalButton, VerticalDivider, button_icon, button_label,
 };
+pub use image::{Image, ImageSource};
+pub use file_dialog::{FileFilter, open_file_dialog, open_image_dialog};
 pub use chart::{
     Candle, Chart, ChartData, ChartOptions, ChartSeries, ChartType, DataPoint, FunnelSlice,
     PieSlice, SankeyLink, SankeyNode, ScaleBand, ScaleLinear, ScalePoint, WaterfallEntry,
@@ -182,6 +190,26 @@ pub use data::{
     GridView, LineChart, LinearProgress, List, ListCustom, ListItem, ListItemR, ListView,
     ListViewCustom, Markdown, PieChart,
     SearchableList, Sparkline, Stepper, TreeNode, TreeView,
+};
+pub use dock_model::{
+    AnchorId, DockableId, DockNodeId, DockRegion, DockTarget, DockableOptions, DockingStyle, NodeIdGenerator,
+    TabPreference, region_is_allowed,
+};
+pub use dock_layout::{
+    DOCK_LAYOUT_FORMAT, DockLayout, DockWindow, MaximizedState, WindowBounds, WindowId,
+    WindowKind, WINDOW_MAIN, parse_dock_layout_text, serialize_dock_layout,
+};
+pub use docking::{
+    DOCK_DRAG_THRESHOLD, DOCK_FLOATING_MIN_H, DOCK_FLOATING_MIN_W, DOCK_HEADER_H,
+    DOCK_MIN_EXTENT, DOCK_RATIO_MAX, DOCK_RATIO_MIN, DOCK_SPLITTER_PX, DOCK_STRIP_THICKNESS,
+    DOCK_ZONE_THRESHOLD, DockContextMenu, DockDirection, DockDragUi, DockEdge, DockLayout,
+    DockTabDropdown, LayoutChangeKind,
+    DockModel, DockNode, DockRect, DockState, DockablePanel, DockingEvent, FloatingPanel,
+    HiddenPanel, PanelId, SavedTreePosition, SplitOrientation, call_dock_panel,
+    clear_dock_panels, default_tab_preference, dock_direction_in_rect, dock_panel_exists,
+    dock_panel_info, dock_preview_rect, dock_split_bounds, dock_state, drain_dock_events,
+    parse_dock_layout, parse_dock_node, register_dock_panel, remember_dock_state,
+    serialize_dock_node, set_default_tab_preference, unregister_dock_panel,
 };
 pub use feedback::{
     AlertDialog, AlertKind, Banner, BottomSheet, CommandPalette, Dialog, EmptyState, HoverCard,
@@ -196,14 +224,16 @@ pub use grid_sheet::{
     GridSheetRow, GridSheetTextAlign,
 };
 pub use input::{
-    BareTextField, Checkbox, CheckboxRow, ColorPicker, ComboBox, ContextMenu, DatePicker, Dropdown,
-    DropdownMenu, FormField, InputBackspace, InputChar, InputCommit, InputCopy, InputCut,
-    InputEnter, InputFocused, InputKey, InputPaste, InputPreedit, InputScroll, InputSelectAll,
-    OtpInput, OutlinedTextField, PasswordField, PopupMenuButton, RadioGroup, RatingBar,
-    RichTextEdit, SetShiftState, Slider, SpinBox, Switch, SwitchRow, TextField, TimePicker,
-    TokenInput, TriState, TriStateCheckbox, dropdown_menu_sections, menu_panel, menu_panel_auto_width,
-    menu_panel_sections, run_menu_callback, set_menu_callback,
+    BareTextField, Checkbox, CheckboxRow, ColorPicker, ComboBox, ContextMenu, DatePicker, copy_text,
+    Dropdown, DropdownMenu, FormField, InputBackspace, InputChar, InputCommit, InputCopy, InputCut,
+    InputEnter, InputFindNext, InputFocused, InputKey, InputPaste, InputPreedit, InputRedo,
+    InputScroll, InputSelectAll, InputUndo, OtpInput, OutlinedTextField, PasswordField,
+    PopupMenuButton, RadioGroup, RatingBar, RichTextEdit, SetShiftState, Slider, SpinBox, Switch,
+    SwitchRow, TextField, TimePicker, TokenInput, TriState, TriStateCheckbox,
+    dropdown_menu_sections, menu_panel, menu_panel_auto_width, menu_panel_sections,
+    run_menu_callback, set_menu_callback,
 };
+pub use rich_text_editor::{RichTextEditor, RichTextEditorHandle, rich_editor_focus};
 pub use layout::{
     AppBarAction, AspectRatio, BottomAppBar, Expandable, FlowRow, Grid, Scaffold, SizedBox,
     SplitColumn, SplitRow, TopAppBar,

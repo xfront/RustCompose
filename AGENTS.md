@@ -217,3 +217,30 @@
 
 ### 文档全面校正（README.md 对齐当前代码）
 - README 长期滞后于代码，本轮按现状逐项校正：①渲染管线 valo 0.9→**0.18**（Cargo.toml 实值）；②顶部示例旧 API `column(c,…)`/`remember(c,…)` → 现代 PascalCase 无 `&mut Composer` 首参（`Column(…)/Text(…)/Button(…)/remember(||…)`），架构表 `@Composable` 行同步；③示例入口 **gallery→story**（全文：运行/跨平台构建/build_apk/已知限制），移除已废弃的 `--dark` 启动参数（现由 Theme 菜单运行时切），补 `STORY_PAGE=<下标|页名>`；④gallery 7 页描述 → story 103 页 / 7 分组（Demos/Basics/Data Display/Layout/Navigation/Feedback/Advanced）；⑤侧栏 `GROUPS` 名与 story 对齐；⑥液态玻璃函数 snake_case→PascalCase（`ToggleLiquidGlass`/`SetLiquidGlass`/`glass_spec()` 无参/`LiquidGlassWallpaper(colors)`）；⑦浮层宿主 `OverlayHost/Overlay/RememberOverlayKey` 去 `c` 参；⑧控件模块表补 `chart.rs`/`grid_sheet.rs`/`rich_text_editor.rs`（实际 13 模块）；⑨菜单栏 Theme 补种子色板 `THEME_PRESETS`+`ColorScheme::from_seed`。AGENTS.md 为历史日志，保留旧记录原样，仅追加本会话新条目。
+
+## 2026-11-09 examples/story.rs 拆分为多文件模块
+
+### 拆分结构
+- 动机：`examples/story.rs` 单文件 5710 行 / 156 个顶层项，改任一页都要在 5.7k 行里定位，维护成本高。
+- 入口与模块声明留在 `examples/story/main.rs`（151 行，含内联的无头探针 `probe_state` / `probe`），实现拆到同目录：
+  - `story/prelude.rs`（35 行）——原文件顶部 `use` 列表整体搬入并改写为 `pub use`，各模块经 `use crate::prelude::*;` 引入（免逐模块重复、保持「改一处即全应用」）；
+  - `story/shell.rs`（534 行）——应用外壳：主题 / 标题栏 / 菜单栏 / 侧栏 / 状态栏 / 页面容器；
+  - `story/common.rs`（77 行）——跨分组共用：`section` / `card_section` / `nav_items` / `nav_sections` / `thread_local`（`MENU_ANCHORS` + `SNACK_HOST`）；
+  - `story/pages/mod.rs`（303 行）——`PAGES` 注册表（标题/图标/说明/渲染函数唯一真源）+ `build_page_body` / `build_page_title` + 7 个分组子模块声明；
+  - `story/pages/{demos,basics,data,layout,navigation,feedback,advanced}.rs`——按 `PAGES` 的 7 分组归置（demos 2497 行含动画 helper，data 730 行，其余 210~430 行）。
+- `examples/Cargo.toml`：example 入口改 `path = "story/main.rs"` + 加 `autoexamples = false`（example 位于子目录，关闭自动发现避免重复目标）。原 `examples/story.rs` 已删除。
+
+### 拆分方法与踩坑（可复用经验）
+- **不要手工搬运 5.7k 行**：用一次性脚本按「顶层项」切片重组——定位第 0 列声明行（fn/struct/impl/const/mod/use/thread_local!）与 `#[...]` 属性行，块 = [块起点, 下一块起点-1]；属性行并入所属项后回溯截断上一块结束行，保证每行恰好归属一块（不重不漏）。
+- **坑① 函数体内缩进的 `#[cfg(test)]`**（`story_shell` 内的探针块）会被误判为顶层属性 → 属性检测必须限定第 0 列，否则会凭空多出「声明项」并切坏函数体。
+- **坑② 注释上吞会与上一块重叠** → 上吞 doc 注释后必须把上一块结束行截断到本块起点-1；否则同一段注释在相邻两模块各出现一次（曾致 prelude.rs 尾部悬空 doc 注释 → `expected item after doc comment`）。
+- **坑③ 批量提可见性时正则吞类型** —— 字段提 `pub(crate)` 用 `re.sub(r'^(    )(\w+):', r'\1pub(crate) \2:', l)` 只替换前缀；直接重写整行会把 `&'static str` 等类型删掉。
+- **坑④ 跨模块引用须显式导入** —— `probe_state` 是 crate 根的 `#[cfg(test)]` 模块，shell 侧需 `#[cfg(test)] use crate::probe_state;`；`nav_items` / `nav_sections` 被外壳侧栏与 NavigationRail 页共用 → 下沉 `common.rs`；`common.rs` 又需 `use crate::pages::{GROUPS, PAGES};`。
+- prelude 的 `use` 必须写 `pub use`，否则 `use crate::prelude::*` 拿不到任何名字（表现为大批 `cannot find type`）。
+- 模块间循环引用合法：`pages/mod.rs` → `use crate::shell::page_group;`，shell → `use crate::pages::{GROUPS, PAGES, build_page_body};`。
+
+### 验证
+- `cargo build --example story` 通过（0 error；拆分未引入新警告，唯一 `Tabs` 命名风格警告为既有）。
+- `cargo test --example story` 通过：`probe::menu_dropdown_flow ... ok`。
+- 实跑 `target/debug/examples/story` 正常：GPU 适配器就绪、64 字体加载、无 panic。
+- 脚本自检：切分 5705/5711 行，未覆盖的 6 行即原模块文档头（已在 main.rs 复现）。

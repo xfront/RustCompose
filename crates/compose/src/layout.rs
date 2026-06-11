@@ -343,6 +343,15 @@ pub(crate) enum ModElem {
         gap: f32,
         match_width: bool,
     },
+    /// 锚定到**窗口全局坐标**：落位期把 `(x, y)` 减去父节点的绝对位置得到父内偏移。
+    ///
+    /// 浮层坐标常来自 `last_pointer_global()` 等窗口坐标，而宿主根节点未必位于
+    /// `(0, 0)`（IDE 外壳的菜单栏/状态栏之下、带 padding 的内容区等）。此时若用
+    /// `Offset`，全局坐标会被当成局部位移，浮层整体偏移到布局中部或窗外。
+    PinAt {
+        x: f32,
+        y: f32,
+    },
     Align(Alignment),
     Weight(f32, bool),
     Clip(f32),
@@ -528,6 +537,13 @@ impl Modifier {
             match_width: true,
         })
     }
+    /// 把浮层左上角锚定到**窗口全局坐标** `(x, y)`（布局期换算，见 [`ModElem::PinAt`]）。
+    ///
+    /// 与 `offset` 的区别：`offset` 是父容器内的相对位移；这里的坐标来自指针事件，
+    /// 宿主根节点自身可能带偏移。另会自动按视口边界夹取，使浮层完整落在窗口内。
+    pub fn pin_at_global(self, x: f32, y: f32) -> Modifier {
+        self.then(ModElem::PinAt { x, y })
+    }
     /// Box 内对齐。
     pub fn align(self, a: Alignment) -> Modifier {
         self.then(ModElem::Align(a))
@@ -610,6 +626,14 @@ impl Modifier {
                 gap,
                 match_width,
             } => Some((*anchor, *dx, *gap, *match_width)),
+            _ => None,
+        })
+    }
+
+    /// [`ModElem::PinAt`] 的窗口全局锚点（若有）。
+    pub(crate) fn pin_at_of(&self) -> Option<(f32, f32)> {
+        self.elems.iter().find_map(|e| match e {
+            ModElem::PinAt { x, y } => Some((*x, *y)),
             _ => None,
         })
     }
@@ -1337,13 +1361,18 @@ fn place_node(rt: &mut Rt, id: NodeId, x: f32, y: f32) {
     PLACED.with(|c| c.set(c.get() + 1));
     // `Modifier.offset`：落位时整体平移（含子树），不影响测量 — Compose 语义。
     let (ofx, ofy) = rt.nodes[id.index()].modifier.offset_of();
-    // `Modifier.pin_to`：落位期解析锚点绝对位置（锚点子树先于本节点落位）。
+    // `Modifier.pin_below` / `pin_at_global`：落位期解析绝对位置（组合期几何尚未就绪，
+    // 此时锚点子树与父节点已完成落位）。
     let pin = rt.nodes[id.index()].modifier.pin_of();
-    let pin_pos = pin.map(|(anchor, pdx, gap, _mw)| {
-        let ah = rt.nodes[anchor.index()].height;
-        let (ax, ay) = node_abs_pos(rt, anchor);
-        (ax + pdx, ay + ah + gap)
-    });
+    let pin_at = rt.nodes[id.index()].modifier.pin_at_of();
+    let is_pin_at = pin.is_none() && pin_at.is_some();
+    let pin_pos = pin
+        .map(|(anchor, pdx, gap, _mw)| {
+            let ah = rt.nodes[anchor.index()].height;
+            let (ax, ay) = node_abs_pos(rt, anchor);
+            (ax + pdx, ay + ah + gap)
+        })
+        .or(pin_at);
     let parent = rt.nodes[id.index()].parent;
     let (ppx, ppy) = if pin_pos.is_some() {
         match parent {
@@ -1359,18 +1388,25 @@ fn place_node(rt: &mut Rt, id: NodeId, x: f32, y: f32) {
         n.y = y + ofy;
         if let Some((tx, ty)) = pin_pos {
             // 锚定后再叠加 `offset`：Compose 的 `offset` 是「落位结果的位移」，
-            // 与位移来源（父链排布 or 锚点绝对位置）无关，漏加即成静默 bug。
+            // 与位移来源（父链排布 / 锚点绝对位置 / 全局坐标）无关，漏加即成静默 bug。
             let mut abs_x = tx + ofx;
+            let mut abs_y = ty + ofy;
             // 浮层智能重定位：面板若伸出窗口左/右边界（如靠右的 TabRow 溢出「⋮」菜单
             // 按内容自然宽展开），则整体平移使其完整落在视口内（留出 4px 边距），
-            // 不被 OS 窗口裁切。面板比视口还宽 / 视口未知时保持原位；纵向溢出交由滚动封顶处理。
-            let vw = viewport_size().0;
+            // 不被 OS 窗口裁切。面板比视口还宽 / 视口未知时保持原位。
+            let (vw, vh) = viewport_size();
             let pw = n.width;
+            let ph = n.height;
             if vw > 0.0 && pw > 0.0 && pw < vw {
                 abs_x = abs_x.min(vw - 4.0 - pw).max(4.0);
             }
+            // `pin_at_global` 的坐标来自指针事件，可能贴近视口底边（底部标签条的「▼」），
+            // 纵向同样夹取；`pin_below` 的纵向溢出仍交由滚动封顶处理。
+            if is_pin_at && vh > 0.0 && ph > 0.0 && ph < vh {
+                abs_y = abs_y.min(vh - 4.0 - ph).max(4.0);
+            }
             n.x = abs_x - ppx;
-            n.y = ty - ppy + ofy;
+            n.y = abs_y - ppy;
         }
     }
     let (cw, ch) = (rt.nodes[id.index()].width, rt.nodes[id.index()].height);
@@ -1657,6 +1693,18 @@ pub enum DrawCmd {
         radius: f32,
     },
     ClipPop,
+    /// 位图：按 `image_id` 从图像注册表取得 `valo::Image` 绘制；`token` 随解码就绪翻转，
+    /// 使保留模式静态块缓存失效并被重绘（避免解码完成前缓存的占位被永久复用）。
+    /// `opacity` 进内容指纹（同图不同透明度视为不同墨迹）。
+    Image {
+        image_id: u64,
+        token: u64,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        opacity: f32,
+    },
 }
 
 /// 文本样式。
@@ -1878,6 +1926,25 @@ impl std::hash::Hash for DrawCmd {
                 hash_f32(state, *radius);
             }
             C::ClipPop => state.write_u8(11),
+            C::Image {
+                image_id,
+                token,
+                x,
+                y,
+                w,
+                h,
+                opacity,
+            } => {
+                state.write_u8(12);
+                // u64 字段走精确写入（f32 精度不足以容纳 id / token）。
+                state.write_u64(*image_id);
+                state.write_u64(*token);
+                hash_f32(state, *x);
+                hash_f32(state, *y);
+                hash_f32(state, *w);
+                hash_f32(state, *h);
+                hash_f32(state, *opacity);
+            }
         }
     }
 }
@@ -1976,6 +2043,22 @@ impl DrawBuilder {
     pub fn fill_rect(&mut self, x: f32, y: f32, w: f32, h: f32, color: Color) {
         if !self.probe {
             self.cmds.push(DrawCmd::FillRect { x, y, w, h, color });
+        }
+        self.grow(x + w, y + h);
+    }
+    /// 位图：emit `DrawCmd::Image`（按 `image_id` 在渲染层解析纹理）。`token` 进内容指纹，
+    /// 解码就绪翻转后使保留模式静态块失效并被重绘。
+    pub fn image(&mut self, image_id: u64, token: u64, x: f32, y: f32, w: f32, h: f32, opacity: f32) {
+        if !self.probe {
+            self.cmds.push(DrawCmd::Image {
+                image_id,
+                token,
+                x,
+                y,
+                w,
+                h,
+                opacity,
+            });
         }
         self.grow(x + w, y + h);
     }
@@ -3061,33 +3144,71 @@ pub fn drag_end_global() -> bool {
     had
 }
 
-// ── 通用二维拖拽（取色器 SV 方块等需同时读 x/y 的手势）──
+// ── 通用二维拖拽（取色器 SV 方块 / 停靠面板拖放等需同时读 x/y 的手势）──
+
+/// 一次二维拖拽会话：`on_move` 逐次收到全局指针，`on_end` 在抬起时收到**最终**全局指针。
+///
+/// `on_end` 是 Docking 之类「拖到哪就放到哪」手势的提交点：没有它，控件只能知道
+/// 拖拽经过的位置，无法在释放那一刻结算放置目标。
+struct Drag2D {
+    on_move: Box<dyn FnMut(f32, f32)>,
+    on_end: Option<Box<dyn FnOnce(f32, f32)>>,
+}
+
 thread_local! {
-    /// 活动二维拖拽回调（全局唯一）：`on_move(全局 x, 全局 y)`。
-    static DRAG_2D: RefCell<Option<Box<dyn FnMut(f32, f32)>>> = const { RefCell::new(None) };
+    /// 活动二维拖拽会话（全局唯一）。
+    static DRAG_2D: RefCell<Option<Drag2D>> = const { RefCell::new(None) };
 }
 
 /// 开始一次二维拖拽（按下时调用）：`on_move` 在指针移动阶段收到全局 `(x, y)`。
 /// 与一维比例会话互斥使用（同一时刻只跑一个手势）。
 pub fn begin_drag_2d(on_move: impl FnMut(f32, f32) + 'static) {
-    DRAG_2D.with(|d| *d.borrow_mut() = Some(Box::new(on_move)));
+    DRAG_2D.with(|d| {
+        *d.borrow_mut() = Some(Drag2D {
+            on_move: Box::new(on_move),
+            on_end: None,
+        })
+    });
+}
+
+/// 带释放回调的二维拖拽：`on_end` 在指针抬起时收到最终全局 `(x, y)`。
+///
+/// 回调同样在 runtime 借用之外执行（take-put），其内部可以安全地写 `MutableState`。
+pub fn begin_drag_2d_with_end(
+    on_move: impl FnMut(f32, f32) + 'static,
+    on_end: impl FnOnce(f32, f32) + 'static,
+) {
+    DRAG_2D.with(|d| {
+        *d.borrow_mut() = Some(Drag2D {
+            on_move: Box::new(on_move),
+            on_end: Some(Box::new(on_end)),
+        })
+    });
 }
 
 /// 指针移动时驱动二维拖拽；返回是否消费了本次移动。
 pub fn drag_2d_move_global(x: f32, y: f32) -> bool {
-    DRAG_2D.with(|d| {
-        if let Some(cb) = d.borrow_mut().as_mut() {
-            cb(x, y);
-            true
-        } else {
-            false
-        }
-    })
+    // take-put：回调可能间接触及 runtime / 再次发起拖拽，不能持有 RefCell 借用。
+    let mut sess = DRAG_2D.with(|d| d.borrow_mut().take());
+    let Some(s) = sess.as_mut() else {
+        return false;
+    };
+    (s.on_move)(x, y);
+    DRAG_2D.with(|d| *d.borrow_mut() = sess);
+    true
 }
 
 /// 指针抬起结束二维拖拽；返回之前是否有活动会话。
 pub fn drag_2d_end_global() -> bool {
-    DRAG_2D.with(|d| d.borrow_mut().take().is_some())
+    let (gx, gy) = last_pointer_global();
+    let mut sess = DRAG_2D.with(|d| d.borrow_mut().take());
+    let Some(s) = sess.as_mut() else {
+        return false;
+    };
+    if let Some(f) = s.on_end.take() {
+        f(gx, gy);
+    }
+    true
 }
 
 // ══════════════════════ 下拉刷新手势（pull-to-refresh） ══════════════════════

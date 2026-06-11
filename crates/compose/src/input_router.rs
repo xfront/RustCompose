@@ -28,6 +28,12 @@ pub struct Handlers {
     pub select_all: fn(),
     pub shift: fn(bool),
     pub scroll: fn(f32),
+    /// 撤销（Ctrl+Z）。
+    pub undo: fn(),
+    /// 重做（Ctrl+Y / Ctrl+Shift+Z）。
+    pub redo: fn(),
+    /// 查找下一个匹配（F3）。
+    pub find_next: fn(),
 }
 
 thread_local! {
@@ -97,4 +103,19 @@ pub fn shift(on: bool) {
 
 pub fn scroll(dy: f32) {
     with(|h| (h.scroll)(dy), ())
+}
+
+/// 撤销（未登记 → no-op）。
+pub fn undo() {
+    with(|h| (h.undo)(), ())
+}
+
+/// 重做（未登记 → no-op）。
+pub fn redo() {
+    with(|h| (h.redo)(), ())
+}
+
+/// 查找下一个匹配（未登记 → no-op）。
+pub fn find_next() {
+    with(|h| (h.find_next)(), ())
 }

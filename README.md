@@ -59,7 +59,10 @@ Column(Modifier::new().fill_max_size(), Arrangement::Center, CrossAxisAlignment:
 | `widgets/data.rs` | data | ListItem / DataTable / DescriptionList / TreeView / BarChart / LineChart / PieChart / Sparkline / Linear·CircularProgress / Stepper / Bubble / DiffView / Markdown |
 | `widgets/feedback.rs` | feedback | Dialog / AlertDialog / BottomSheet / ModalDrawer / Tooltip / Popover / HoverCard / Snackbar(+Host) / Banner / InlineAlert / Skeleton / Spinner / EmptyState / Notification(Stack) / CommandPalette |
 | `widgets/navigation.rs` | navigation | NavigationBar / NavigationRail / NavigationDrawer / Sidebar / TabRow / Breadcrumb / Pagination / Carousel / Toolbar / TitleBar / StatusBar |
+| `widgets/docking.rs` | docking | DockLayout / DockState / DockNode / DockablePanel：可拖拽停靠面板（布局树 + 5 区罗盘 + 标签页重排/重停靠 + 分割条 + 最大化 + 自动隐藏边条 + 浮动窗口 + 布局序列化） |
+| `widgets/dock_layout.rs` | docking | **DockLayout（对齐 compose-docking `DockLayout.kt`）**：窗口列表模型 `DockLayout`/`DockWindow`/`WindowKind`/`WindowBounds`/`MaximizedState` + KT 不变式 + `dl1` 持久化 |
 | `widgets/advanced.rs` | advanced | VerticalScroll / HorizontalScroll / Calendar / CodeBlock / RichText / SettingsSection·Item / MediaSurface |
+| `widgets/rich_text_editor.rs` | advanced | **RichTextEditor（Quill 风格富文本）**：块/行内格式工具栏 + 选区 + 撤销重做 + 查找高亮 + HTML/Markdown 导入导出 |
 | `widgets/animation.rs` | animation | AnimatedVisibility / Crossfade / FadeThrough / SharedAxis / SlideIn / Pulse |
 | `widgets/overlay.rs` | root_window+overlay | 全局浮层宿主（Dialog/菜单/Tooltip 统一叠最上层） |
 | `widgets/glass.rs` | — | 液态玻璃开关与壁纸 |
@@ -67,6 +70,109 @@ Column(Modifier::new().fill_max_size(), Arrangement::Center, CrossAxisAlignment:
 **浮层宿主**：应用根包一层 `OverlayHost(Modifier::new().fill_max_size(), || { .. })`，
 树内任意深度的控件都能用 `Overlay(key, open, || { .. })` 把内容叠到最上层——
 不会撑大父容器、不被父级裁剪、不受滚动影响。key 由 `RememberOverlayKey()` 稳定持有。
+
+## Quill 风格富文本编辑器（`RichTextEditor`）
+
+`RichTextEditor(Modifier::new().fill_max_width().height(360.0))` 返回一个
+`RichTextEditorHandle`，可直接编辑文档块并订阅变更。
+
+```rust
+let h = RichTextEditor(Modifier::new().fill_max_width().height(360.0));
+h.set_html("<h2>标题</h2><p>正文 <b>加粗</b></p>");
+h.toggle_bold();                 // 块/行内格式
+h.set_link("https://example.com");
+h.undo(); h.redo();              // 撤销 / 重做
+h.set_find("关键字"); h.find_next();  // 查找（命中高亮，F3 循环）
+let html = h.to_html();          // 导出 HTML
+let md   = h.to_markdown();      // 导出 Markdown
+h.to_plain_text(); h.char_count();
+```
+
+能力：
+- **块格式** ¶ / H1 / H2 / H3 / ❝引用 / UL / OL / ☑任务列表 / 代码块
+- **行内格式** B / I / U / S / `</>` 行内代码 / 文字颜色 / 超链接（pending format 继承）
+- **选区** 鼠标拖选、Shift+方向键扩选、Ctrl+A 全选、Ctrl+C/X/V 剪贴板
+- **撤销重做** 每次编辑压入历史快照（上限 200 步），Ctrl+Z / Ctrl+Y / Ctrl+Shift+Z
+- **查找** 关键字命中高亮（当前命中加深），F3 跳下一个
+- **导入导出** `set_html` / `to_html` / `to_markdown`（HTML 解析支持
+  `h1~h3/p/ul/ol/li/blockquote/pre` 与 `b/i/u/s/code/a/span[color]` 行内标签）
+
+> 控件须**每次组合都调用**（状态由内部 `remember` 持有）；内容注入用一次性守卫，
+> 不要放在 `remember` 初始化闭包里，否则重组后编辑器节点会丢失。
+
+## FAB（悬浮动作按钮 / ExpandableFab）
+
+参考 flutter_expandable_fab 实现的完整 FAB 家族：
+
+```rust
+// 四种尺寸（FabSize::Regular / Small / Large + ExtendedFab）
+FabEx(IconName::Add, FabSize::Small, Modifier::new(), || {});
+Fab(IconName::Add, Modifier::new(), || {});            // = FabEx(Regular)
+FabEx(IconName::Add, FabSize::Large, Modifier::new(), || {});
+ExtendedFab(IconName::Add, "Extended", Modifier::new(), || {});
+
+// 可展开 FAB：Up（向上）/ Side（向左）/ Fan（扇形）
+let open = remember(|| mutableStateOf(false));
+ExpandableFab(
+    IconName::Add,
+    &[(IconName::Edit, "编辑".into()), (IconName::Share, "分享".into())],
+    FabExpandType::Up,
+    open,
+    Modifier::new(),
+);
+```
+
+- **展开方向** `FabExpandType::Up / Side / Fan`：固定尺寸裁切盒 + 条目从 FAB 方向滑入
+  （FAB 本身不动，对齐 M3 交互）。Fan 为**真实径向扇形**：条目按极坐标
+  `angle = 180° + i·fan_angle/(n-1)`（180°=左 → 270°=上）、`distance·progress` 从 FAB 中心
+  向左上 90° 扇区辐射，收起时整体向下推出裁切盒外裁掉；
+- **开合反馈** 展开时主图标自动切换为 `Close`；
+- **动作项** 胶囊（标签 + 图标，`secondary_container`），点击后自动收起；
+- **状态提升** 展开/收起由外部 `MutableState<bool>` 驱动，须放在**函数作用域**的
+  `remember` 里——放在闭包（如 `Row { .. }`）内部会因槽位错位读错状态。
+
+## Docking：窗口列表模型（对齐 `DockLayout.kt`）
+
+停靠布局的**持久化模型**对齐 compose-docking 的
+`model/DockLayout.kt`（布局 = 窗口列表，瞬时 UI 状态留在 `DockState`）：
+
+```rust
+use compose_material::{DockLayout, DockWindow, WindowKind, WindowBounds, MaximizedState};
+
+let layout = DockLayout {
+    windows: vec![
+        DockWindow {                       // windows[0] 必须是主窗口
+            id: WINDOW_MAIN,
+            kind: WindowKind::Main,
+            root: Some(DockNode::tabs(&[1, 2])),
+            maximized: Some(MaximizedState {   // 还原最大化 = 纯值替换
+                dockable_id: 1,
+                saved_root: Some(DockNode::tabs(&[3, 4])),
+            }),
+            bounds: None,
+        },
+        DockWindow {                       // 其余只能是浮动窗口
+            id: 1,
+            kind: WindowKind::Floating,
+            root: Some(DockNode::tabs(&[5])),
+            maximized: None,
+            bounds: Some(WindowBounds { x: 10.0, y: 20.0, width: 300.0, height: 200.0 }),
+        },
+    ],
+};
+assert!(layout.is_valid());               // KT 的 init 不变式
+```
+
+- **KT 不变式**（`is_valid`）：窗口列表非空、`windows[0]` 是主窗口、其余是浮动窗口、
+  窗口 id 不重复——KT 用 `require` 抛错，Rust 侧改为显式校验，避免 panic；
+- **访问器** 与 KT 同名同义：`main_window` / `floating_windows` / `window` /
+  `require_window` / `replace_window` / `empty`；
+- **与运行时衔接**：`DockState::layout()` 给出窗口视图，`DockState::set_layout()`
+  整份写回（KT 语义：计算整份下一份布局再赋值一次）；
+- **持久化**：`serialize_dock_layout` / `parse_dock_layout_text`（`dl1` 格式），
+  窗口 id + 种类 + 边界 + 最大化状态 + 根树全部可往返；
+- 自动隐藏边条是 Rust 扩展、KT 模型无对应概念，故不进入窗口列表，
+  由既有 `save_full_state`/`restore_full_state`（`mdl1`）无损承载。
 
 ## 液态玻璃（一个函数切换）
 
@@ -226,7 +332,8 @@ Snap / 重播 / 孤儿剪枝）、`crates/compose/tests/animation_idle.rs`（停
 
 ## 已知限制（第一阶段）
 
-- **单窗口 / 单 Composition**：runtime 为 thread_local 单组合设计，多窗口需作用域/节点 arena 按组合隔离
+- **单窗口 / 单 Composition**：runtime 为 thread_local 单组合设计，多窗口需作用域/节点 arena 按组合隔离；因此 `DockLayout` 的「浮动窗口」是树内绝对定位浮层（带标题栏拖动/缩放/回靠），不是 OS 级独立窗口
+- Docking 面板注册表为 thread_local 全局表（单组合前提）：注册表与几何表按组合期刷新，跨组合/多实例并存需额外隔离；标签头拖放的释放点依赖核心 `begin_drag_2d_with_end` 的抬起回调
 - 重组复用按位置编码（对齐 SlotTable 语义），**同作用域内 if/else 分支结构需稳定**（Compose 同规则，需 key 的场景用 `keyed_remember`）
 - `TextField` 为精简版（点击聚焦 + 字符/退格路由）；无 IME / 选区
 - 坐标系为窗口物理像素，`Density` 贯通（dp 逻辑像素）待接

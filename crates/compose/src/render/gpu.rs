@@ -294,6 +294,19 @@ impl GpuRenderer {
             t3.duration_since(t2).as_secs_f32() * 1e3,
         );
     }
+
+    /// 把一段 RGBA8 像素上传为 GPU 纹理，返回可按 `image_id` 复用的 `valo::Image` 句柄。
+    ///
+    /// 像素必须是 `4 * w * h` 字节（行优先）。失败（尺寸/格式不符）由 valo 内部 panic，
+    /// 调用方需保证像素来自已成功解码的位图。
+    pub fn upload_image(&mut self, _id: u64, pixels: &[u8], w: u32, h: u32) -> valo::Image {
+        let desc = valo::ImageDesc {
+            size: [w, h],
+            premultiplied: false,
+            mips: true,
+        };
+        self.context.upload_image(desc, pixels)
+    }
 }
 
 /// 临时诊断：把 acquire / plan+encode / present 三段耗时按 60 帧窗口打到 stderr。

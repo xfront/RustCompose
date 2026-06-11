@@ -30,7 +30,7 @@ fn right_edge_dropdown_is_shifted_into_view() {
                 // 长文字 → 自然宽明显大于锚点宽，若左对齐锚点必然伸出右边界。
                 let items: Vec<String> =
                     vec!["A_LONG_MENU_ITEM_LABEL_TEXT".to_string(); 3];
-                DropdownMenu(anchor, KEY, &items, open, |_| {}, false);
+                DropdownMenu(anchor, KEY, &items, open, false, |_| {});
             });
         });
     });

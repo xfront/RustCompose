@@ -7,3 +7,10 @@ description = "Material 3 widgets for compose — Jetpack Compose-style Rust GUI
 
 [dependencies]
 compose = { path = "../compose" }
+# 位图解码（第一阶段 desktop）：PNG / JPEG / GIF / BMP 纯 Rust 解码器，无系统库依赖。
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp"] }
+
+# ── Desktop（仅桌面，不含 wasm/android/ios/ohos）：原生文件对话框 ──────
+# 参考 rui：阻塞式 `rfd::FileDialog::pick_file()` 调用系统原生对话框。
+[target.'cfg(all(not(target_arch = "wasm32"), not(target_os = "android"), not(target_os = "ios"), not(target_env = "ohos")))'.dependencies]
+rfd = "0.17"

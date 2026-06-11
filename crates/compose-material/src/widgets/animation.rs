@@ -370,7 +370,7 @@ fn arc_points<const N: usize>(cx: f32, cy: f32, r: f32, a0: f32, a1: f32) -> [(f
     pts
 }
 
-/// `PullToRefresh(refreshing, on_refresh) { content }` — 液态下拉刷新。
+/// `PullToRefresh(refreshing, modifier, on_refresh) { content }` — 液态下拉刷新。
 ///
 /// * `content` 被放入垂直滚动容器；滚动到顶时向下拖拽进入下拉手势，
 ///   内容随阻尼下移，顶部呈现「液面下凹 + 谷底旋转进度环」。
@@ -379,8 +379,8 @@ fn arc_points<const N: usize>(cx: f32, cy: f32, r: f32, a0: f32, a1: f32) -> [(f
 ///   `refreshing` 置回 `false`，指示器弹簧收回。
 pub fn PullToRefresh(
     refreshing: MutableState<bool>,
-    on_refresh: impl Fn() + 'static,
     modifier: Modifier,
+    on_refresh: impl Fn() + 'static,
     content: impl Fn() + 'static,
 ) {
     const THRESHOLD: f32 = 64.0;

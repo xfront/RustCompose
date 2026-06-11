@@ -1,6 +1,6 @@
 //! 回归：`ListCustom` / `ListViewCustom` 支持自定义 item，且「整行（含自定义内容）点击选中」。
 //!
-//! 形如 Jetpack Compose：`ListCustom(count, |i| { 任意 widget }, selected, mod)`。
+//! 形如 Jetpack Compose：`ListCustom(count, selected, modifier, |i| { 任意 widget })`。
 //! 行外壳（整行点击选中 + `secondary_container` 高亮）由 `list_row` 统一提供，
 //! 故点击自定义内容（图标/文字/副标题）或左右 padding / 上下留白都归属同一行。
 
@@ -67,12 +67,12 @@ fn boot(with_scroll: bool) -> (NodeId, MutableState<usize>, f32, f32) {
             if with_scroll {
                 ListViewCustom(
                     N,
-                    custom_item,
                     sel,
                     Modifier::new().fill_max_width().height(200.0),
+                    custom_item,
                 );
             } else {
-                ListCustom(N, custom_item, sel, Modifier::new().fill_max_width());
+                ListCustom(N, sel, Modifier::new().fill_max_width(), custom_item);
             }
         });
     });

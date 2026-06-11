@@ -187,8 +187,8 @@ fn pull_to_refresh_spinner_rotates_in_draw_phase() {
         MaterialTheme(ColorScheme::light(), move || {
             PullToRefresh(
                 refreshing,
-                || {},
                 Modifier::new().fill_max_width().height(200.0),
+                || {},
                 || Text("row", TextStyle::new(), Modifier::new()),
             );
         });
@@ -236,8 +236,8 @@ fn pull_to_refresh_collapses_and_sleeps() {
         MaterialTheme(ColorScheme::light(), move || {
             PullToRefresh(
                 refreshing,
-                || {},
                 Modifier::new().fill_max_width().height(200.0),
+                || {},
                 move || {
                     Text("row 1", TextStyle::new(), Modifier::new());
                     Text("row 2", TextStyle::new(), Modifier::new());

@@ -6,8 +6,8 @@ use compose::layout::{DrawCmd, TextStyle};
 use compose::prelude::Color;
 use valo::{
     Backdrop, Color as ValoColor, DisplayList, DisplayListBuilder, DrawParagraphExt, FillRule, Paint,
-    PaintStyle, PathBuilder, Point as ValoPoint, Rect as ValoRect, Stroke, ClipOp,
-    FontCollection, Paragraph, ParagraphBuilder, TextStyle as ValoTextStyle,
+    PaintStyle, PathBuilder, Point as ValoPoint, Rect as ValoRect, Stroke, ClipOp, FontCollection,
+    Paragraph, ParagraphBuilder, TextStyle as ValoTextStyle,
 };
 
 pub fn to_valo_color(c: &Color) -> ValoColor {
@@ -275,6 +275,27 @@ pub fn record_cmds(b: &mut DisplayListBuilder, cmds: &[DrawCmd], tc: &mut TextCo
             }
             DrawCmd::ClipPop => {
                 b.restore();
+            }
+            DrawCmd::Image {
+                image_id,
+                x,
+                y,
+                w,
+                h,
+                ..
+            } => {
+                let rect = ValoRect::from_ltrb(*x, *y, *x + *w, *y + *h);
+                if let Some(img) = crate::render::image_cache::get_uploaded(*image_id) {
+                    // 纹理就绪：整图缩放填充到目标矩形（rgba8，线性过滤 + 边缘 clamp）。
+                    b.draw_image(&img, rect, &Paint::default());
+                } else {
+                    // 兜底占位（控件未就绪时应直接画占位；此处保证不会因 id 缺失而漏绘）。
+                    let ph = Paint {
+                        color: ValoColor::rgba(0.0, 0.0, 0.0, 0.12),
+                        ..Default::default()
+                    };
+                    b.draw_rect(rect, &ph);
+                }
             }
         }
     }

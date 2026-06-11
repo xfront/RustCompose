@@ -481,18 +481,56 @@ pub fn ButtonEx(
     button_core(modifier, opts, on_click, content);
 }
 
-/// `FloatingActionButton(icon, onClick)` — 56dp / 圆角 16 / `primary_container`（M3 FAB）。
-pub fn Fab(name: IconName, modifier: Modifier, on_click: impl FnMut() + 'static) {
+/// FAB 尺寸变体（对齐 Material 3 / Flutter FloatingActionButtonSize）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum FabSize {
+    /// Regular：56×56，圆角 16。
+    Regular,
+    /// Small：40×40，圆角 12。
+    Small,
+    /// Large：96×96，圆角 28。
+    Large,
+}
+
+/// 可展开 FAB 的展开方向（对齐 flutter_expandable_fab 的 ExpandableFabType）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum FabExpandType {
+    /// 垂直向上展开（默认）。
+    Up,
+    /// 水平向左展开。
+    Side,
+    /// 扇形展开（向上并左右散开）。
+    Fan,
+}
+
+const FAB_SMALL: f32 = 40.0;
+const FAB_LARGE: f32 = 96.0;
+const FAB_SMALL_ICON: f32 = 20.0;
+const FAB_LARGE_ICON: f32 = 36.0;
+const FAB_SMALL_RADIUS: f32 = 12.0;
+const FAB_LARGE_RADIUS: f32 = 28.0;
+
+fn fab_dims(size: FabSize) -> (f32, f32, f32, f32) {
+    match size {
+        FabSize::Regular => (tokens::FAB_SIZE, tokens::FAB_SIZE, tokens::FAB_ICON, tokens::FAB_RADIUS),
+        FabSize::Small => (FAB_SMALL, FAB_SMALL, FAB_SMALL_ICON, FAB_SMALL_RADIUS),
+        FabSize::Large => (FAB_LARGE, FAB_LARGE, FAB_LARGE_ICON, FAB_LARGE_RADIUS),
+    }
+}
+
+/// 带尺寸变体的悬浮动作按钮（`FabSize::Regular` 等价于原 `Fab`）。
+pub fn FabEx(name: IconName, size: FabSize, modifier: Modifier, on_click: impl FnMut() + 'static) {
     let colors = theme_colors();
+    let (w, h, ic, radius) = fab_dims(size);
     button_core(
-        modifier.size(tokens::FAB_SIZE, tokens::FAB_SIZE),
+        modifier.size(w, h),
         ButtonOpts {
             variant: ButtonVariant::Secondary,
             elevated: true,
             bg_override: Some(colors.primary_container),
             fg_override: Some(colors.on_primary_container),
-            radius: tokens::FAB_RADIUS,
-            min_height: tokens::FAB_SIZE,
+            radius,
+            min_height: h,
             pad_h: 0.0,
             pad_v: 0.0,
             ..Default::default()
@@ -501,12 +539,17 @@ pub fn Fab(name: IconName, modifier: Modifier, on_click: impl FnMut() + 'static)
         move || {
             icon(
                 name,
-                tokens::FAB_ICON,
+                ic,
                 LocalContentColor::current(),
                 Modifier::new().align(Alignment::Center),
             );
         },
     );
+}
+
+/// `FloatingActionButton(icon, onClick)` — 56dp / 圆角 16 / `primary_container`（M3 FAB）。
+pub fn Fab(name: IconName, modifier: Modifier, on_click: impl FnMut() + 'static) {
+    FabEx(name, FabSize::Regular, modifier, on_click);
 }
 
 /// `ExtendedFAB(icon, label, onClick)` — 高 56 / 圆角 16 / `labelLarge`。
@@ -549,79 +592,240 @@ pub fn ExtendedFab(
     );
 }
 
-/// 可展开 FAB：点击展开一组动作按钮（高度动画）。
+/// 可展开 FAB：点击在展开/收起间切换，动作项以 `expand_type` 指定的方向滑出
+/// （高度/宽度裁切 + 从 FAB 中心滑出，对齐 flutter_expandable_fab）。
+///
+/// - 展开时主图标在 `name` 与 `Close` 间切换，提示可收起；
+/// - 每个动作项点击后收起菜单；
+/// - 四种尺寸由 `Fab` / `FabEx` / `ExtendedFab` 提供。
 pub fn ExpandableFab(
     name: IconName,
     actions: &[(IconName, String)],
+    expand_type: FabExpandType,
     expanded: MutableState<bool>,
     modifier: Modifier,
 ) {
-    let colors = theme_colors();
     let open = expanded.get();
     let frac = compose::animation::animate_float_as_state(
         if open { 1.0 } else { 0.0 },
         compose::animation::Tween::new(0.22),
     );
     let items: Vec<(IconName, String)> = actions.to_vec();
-    let est = items.len() as f32 * 48.0;
     let ex = expanded;
+
     Column(
         modifier,
         Arrangement::Start,
         CrossAxisAlignment::End,
         move || {
             let items = items.clone();
-            Box(
-                Modifier::new().height(frac * est).clip(0.0),
-                Alignment::TopStart,
-                move || {
-                    let items = items.clone();
-                    Column(
-                        Modifier::new(),
-                        Arrangement::Start,
-                        CrossAxisAlignment::End,
+            let ex = ex.clone();
+            // 动作项展开区域：固定尺寸裁切盒 + 条目从 FAB 方向滑入（FAB 本身不动）
+            match expand_type {
+                FabExpandType::Up => {
+                    let est = items.len() as f32 * (tokens::CONTROL_HEIGHT + tokens::SPACE_SM);
+                    Box(
+                        Modifier::new().height(est).clip(0.0),
+                        Alignment::BottomEnd,
                         move || {
-                            for (ic, lb) in items.clone() {
-                                let lb = lb.clone();
-                                let ex2 = ex;
-                                let m = Modifier::new()
-                                    .height(tokens::CONTROL_HEIGHT)
-                                    .padding_ltrb(tokens::SPACE_MD, 0.0, tokens::SPACE_MD, 0.0)
-                                    .background(colors.secondary_container, tokens::SHAPE_MEDIUM);
-                                let id = add_node(
-                                    Policy::Row {
-                                        arrangement: Arrangement::Center,
-                                        cross: CrossAxisAlignment::Center,
-                                    },
-                                    m,
-                                );
-                                with_rt_pub(|rt| {
-                                    rt.nodes[id.index()].on_click =
-                                        Some(Box::new(move || ex2.set(false)));
-                                });
-                                with_content_scope(id, move || {
-                                    Text(
-                                        lb.clone(),
-                                        tokens::label_large(colors.on_secondary_container),
-                                        Modifier::new(),
-                                    );
-                                    Spacer(Modifier::new().width(tokens::SPACE_SM));
-                                    icon(
-                                        ic,
-                                        tokens::ICON_SMALL,
-                                        colors.on_secondary_container,
-                                        Modifier::new(),
-                                    );
-                                });
-                            }
+                            let items = items.clone();
+                            let ex = ex.clone();
+                            reveal_fab_items(items, frac, est, ex, expand_type);
                         },
                     );
-                },
-            );
-            let ex3 = ex;
-            Fab(name, Modifier::new(), move || ex3.update(|v| *v = !*v));
+                    Spacer(Modifier::new().height(tokens::SPACE_SM));
+                    fab_toggle(name, open, ex.clone());
+                }
+                FabExpandType::Side => {
+                    let est = items.len() as f32 * 168.0;
+                    Box(
+                        Modifier::new().width(est).clip(0.0),
+                        Alignment::CenterEnd,
+                        move || {
+                            let items = items.clone();
+                            let ex = ex.clone();
+                            reveal_fab_items(items, frac, est, ex, expand_type);
+                        },
+                    );
+                    Spacer(Modifier::new().height(tokens::SPACE_SM));
+                    fab_toggle(name, open, ex.clone());
+                }
+                FabExpandType::Fan => {
+                    // 相对定位裁切盒：FAB 置于右下角，条目按极坐标从 FAB 中心
+                    // 向左上 90° 扇区（180°→270°）辐射；收起时整体向下推出盒外裁掉。
+                    let distance = 110.0_f32;
+                    let fan_angle = 90.0_f32;
+                    let chip_w = 168.0_f32;
+                    let chip_h = tokens::CONTROL_HEIGHT;
+                    let fab_w = tokens::FAB_SIZE;
+                    let fab_h = tokens::FAB_SIZE;
+                    let box_w = distance + chip_w + 16.0;
+                    let box_h = distance + chip_h + 16.0;
+                    Box(
+                        Modifier::new().size(box_w, box_h).clip(0.0),
+                        Alignment::TopStart,
+                        move || {
+                            let items = items.clone();
+                            let ex = ex.clone();
+                            let n = items.len() as f32;
+                            // 条目先画（FAB 最后画覆盖收起态的条目）
+                            for (i, (ic, lb)) in items.iter().enumerate() {
+                                let lb = lb.clone();
+                                let ex2 = ex.clone();
+                                let ic = *ic;
+                                let dir = if n > 1.0 {
+                                    fan_angle / (n - 1.0) * i as f32
+                                } else {
+                                    fan_angle / 2.0
+                                };
+                                // 180°=左、270°=上（屏幕坐标 y 向下）；向左上扇区辐射
+                                let angle_rad =
+                                    (180.0_f32 + dir) * std::f32::consts::PI / 180.0;
+                                let dx = angle_rad.cos() * distance * frac;
+                                let dy = angle_rad.sin() * distance * frac;
+                                let cx = box_w - fab_w / 2.0;
+                                let cy = box_h - fab_h / 2.0;
+                                let push = (1.0 - frac) * (box_h + chip_h);
+                                let wrap_w = 180.0_f32;
+                                let wrap_h = chip_h + 8.0;
+                                let center_x = cx + dx;
+                                let center_y = cy + dy + push;
+                                Box(
+                                    Modifier::new()
+                                        .offset(center_x - wrap_w / 2.0, center_y - wrap_h / 2.0)
+                                        .size(wrap_w, wrap_h),
+                                    Alignment::Center,
+                                    move || {
+                                        fab_action_item(
+                                            ic,
+                                            lb.clone(),
+                                            Modifier::new(),
+                                            move || ex2.set(false),
+                                        )
+                                    },
+                                );
+                            }
+                            // FAB 本体（右下角，展开态显示关闭图标）
+                            let ex4 = ex.clone();
+                            let nm = if open { IconName::Close } else { name };
+                            Box(
+                                Modifier::new()
+                                    .offset(box_w - fab_w, box_h - fab_h)
+                                    .size(fab_w, fab_h),
+                                Alignment::TopStart,
+                                move || {
+                                    FabEx(
+                                        nm,
+                                        FabSize::Regular,
+                                        Modifier::new(),
+                                        move || ex4.update(|v| *v = !*v),
+                                    )
+                                },
+                            );
+                        },
+                    );
+                }
+            }
         },
     );
+}
+
+/// FAB 本体（Up/Side 分支用）：展开态显示关闭图标，点击切换开合。
+fn fab_toggle(name: IconName, open: bool, ex: MutableState<bool>) {
+    let nm = if open { IconName::Close } else { name };
+    let ex2 = ex.clone();
+    FabEx(nm, FabSize::Regular, Modifier::new(), move || ex2.update(|v| *v = !*v));
+}
+
+/// 渲染动作项（标签 + 图标的小胶囊），按 `expand_type` 排列，并以 `frac` 从 FAB 方向滑入。
+///
+/// `est` 是裁切盒的固定尺寸：收起时条目整体偏移 `est` 被裁掉，展开时归位。
+fn reveal_fab_items(
+    items: Vec<(IconName, String)>,
+    frac: f32,
+    est: f32,
+    ex: MutableState<bool>,
+    kind: FabExpandType,
+) {
+    let slide = (1.0 - frac) * est;
+    match kind {
+        FabExpandType::Side => {
+            Row(
+                Modifier::new(),
+                Arrangement::End,
+                CrossAxisAlignment::Center,
+                move || {
+                    let items = items.clone();
+                    let ex = ex.clone();
+                    for (i, (ic, lb)) in items.iter().enumerate() {
+                        let lb = lb.clone();
+                        let ex2 = ex.clone();
+                        let ic = *ic;
+                        let m = Modifier::new().offset(slide, 0.0);
+                        fab_action_item(ic, lb, m, move || ex2.set(false));
+                        if i + 1 < items.len() {
+                            Spacer(Modifier::new().width(tokens::SPACE_SM));
+                        }
+                    }
+                },
+            );
+        }
+        _ => {
+            // Up：垂直堆叠，靠下对齐（紧邻 FAB 上方）
+            Column(
+                Modifier::new(),
+                Arrangement::End,
+                CrossAxisAlignment::End,
+                move || {
+                    let items = items.clone();
+                    let ex = ex.clone();
+                    for (i, (ic, lb)) in items.iter().enumerate() {
+                        let lb = lb.clone();
+                        let ex2 = ex.clone();
+                        let ic = *ic;
+                        let m = Modifier::new().offset(0.0, slide);
+                        fab_action_item(ic, lb, m, move || ex2.set(false));
+                        if i + 1 < items.len() {
+                            Spacer(Modifier::new().height(tokens::SPACE_SM));
+                        }
+                    }
+                },
+            );
+        }
+    }
+}
+
+/// 单个动作项：右侧图标 + 左侧文字标签的胶囊（点击执行 `on_click`）。
+fn fab_action_item(ic: IconName, lb: String, modifier: Modifier, on_click: impl FnMut() + 'static) {
+    let colors = theme_colors();
+    let m = modifier
+        .height(tokens::CONTROL_HEIGHT)
+        .padding_ltrb(tokens::SPACE_MD, 0.0, tokens::SPACE_MD, 0.0)
+        .background(colors.secondary_container, tokens::SHAPE_MEDIUM);
+    let id = add_node(
+        Policy::Row {
+            arrangement: Arrangement::Center,
+            cross: CrossAxisAlignment::Center,
+        },
+        m,
+    );
+    with_rt_pub(|rt| {
+        rt.nodes[id.index()].on_click = Some(Box::new(on_click));
+    });
+    with_content_scope(id, move || {
+        Text(
+            lb.clone(),
+            tokens::label_large(colors.on_secondary_container),
+            Modifier::new(),
+        );
+        Spacer(Modifier::new().width(tokens::SPACE_SM));
+        icon(
+            ic,
+            tokens::ICON_SMALL,
+            colors.on_secondary_container,
+            Modifier::new(),
+        );
+    });
 }
 
 // ══════════════════════════════ Chip ══════════════════════════════
@@ -944,28 +1148,49 @@ pub fn Kbd(keys: &[String], modifier: Modifier) {
     );
 }
 
-/// `GroupBox(title) { content }` — 带标题的分组框（M3：`outline_variant` + `titleSmall`）。
+/// `GroupBox(title) { content }` — 带标题的分组框（fieldset 语义）：内容盒整体带
+/// `outline_variant` 描边，标题（`titleSmall` / `on_surface_variant`）**压在顶边框上**，
+/// 边线从标题文字后方穿过（文字用 `Surface` 底色遮线），与内容盒左内边距对齐。
 pub fn GroupBox(title: impl Into<String>, modifier: Modifier, content: impl Fn() + 'static) {
     let colors = theme_colors();
     let g = glass_spec();
     let title = title.into();
-    let m = GlassOrBg(modifier, g, colors.Surface, tokens::SHAPE_MEDIUM)
-        .border(1.0, colors.outline_variant, tokens::SHAPE_MEDIUM)
-        .padding_hv(tokens::SPACE_LG, tokens::SPACE_MD);
-    let id = add_node(
-        Policy::Column {
-            arrangement: Arrangement::Start,
-            cross: CrossAxisAlignment::Start,
-        },
-        m,
-    );
+    // 外层是 `Fn`（可多次重组），`content` 不能被内层 `move` 闭包拿走 —— 用 `Rc` 共享。
+    let content = std::rc::Rc::new(content);
+    let half = tokens::title_small(colors.on_surface_variant)
+        .line_height
+        .unwrap_or(20.0)
+        / 2.0;
+    // 顶部预留半行高：标题上移半行后，垂直中心恰好落在内容盒顶边框线上。
+    let outer = modifier.padding_ltrb(0.0, half, 0.0, 0.0);
+    let id = add_node(Policy::Box(Alignment::TopStart), outer);
     with_content_scope(id, move || {
+        // 内容盒：顶内边距 = 标题下半侵入（half）+ 常规内边距。
+        let m = GlassOrBg(
+            Modifier::new().fill_max_width().padding_ltrb(
+                tokens::SPACE_LG,
+                half + tokens::SPACE_MD,
+                tokens::SPACE_LG,
+                tokens::SPACE_MD,
+            ),
+            g,
+            colors.Surface,
+            tokens::SHAPE_MEDIUM,
+        )
+        .border(1.0, colors.outline_variant, tokens::SHAPE_MEDIUM);
+        let c = content.clone();
+        Column(m, Arrangement::Start, CrossAxisAlignment::Start, move || {
+            c();
+        });
+        // 标题：上移半行压在边框线上；`Surface` 背景 + 水平内边距遮住穿过的线段。
         Text(
             title.clone(),
             tokens::title_small(colors.on_surface_variant),
-            Modifier::new().padding_ltrb(0.0, 0.0, 0.0, tokens::SPACE_SM),
+            Modifier::new()
+                .offset(tokens::SPACE_LG, -half)
+                .background(colors.Surface, 0.0)
+                .padding_hv(tokens::SPACE_SM, 0.0),
         );
-        content();
     });
 }
 

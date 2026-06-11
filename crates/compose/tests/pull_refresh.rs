@@ -18,13 +18,13 @@ fn setup() -> (compose::layout::NodeId, compose::runtime::MutableState<bool>, co
     comp.set_content(move || {
         MaterialTheme(ColorScheme::light(), move || {
             PullToRefresh(refreshing,
+                Modifier::new().fill_max_width().height(200.0),
                 {
                     let t = triggered;
                     move || {
                         t.update(|n| *n += 1);
                     }
                 },
-                Modifier::new().fill_max_width().height(200.0),
                 move || {
                     Text("row 1", TextStyle::new(), Modifier::new());
                     Text("row 2", TextStyle::new(), Modifier::new());
@@ -80,8 +80,8 @@ fn pull_refresh_draws_indicator_when_refreshing() {
     comp.set_content(move || {
         MaterialTheme(ColorScheme::light(), move || {
             PullToRefresh(refreshing,
-                || {},
                 Modifier::new().fill_max_width().height(200.0),
+                || {},
                 move || {
                     Text("row 1", TextStyle::new(), Modifier::new());
                 },

@@ -13,6 +13,7 @@
 use std::any::{Any, TypeId};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
 
 use crate::foundation::Constraints;
 use crate::layout::{NodeId, NodeRef};
@@ -192,6 +193,27 @@ pub fn with_rt_pub<R>(f: impl FnOnce(&mut RuntimeData) -> R) -> R {
 /// 公开 runtime 访问（测试 / 平台后端事件注入用）。
 pub fn with_runtime<R>(f: impl FnOnce(&mut RuntimeData) -> R) -> R {
     with_rt(f)
+}
+
+/// 主线程任务队列：后台线程（如文件对话框的阻塞 `rfd` 调用）把结果回调投递到这里，
+/// 由 `Kernel::frame` 在「运行时 `RefCell` 借用尚未建立」时排空，从而安全调用
+/// `MutableState::set` 等需 `with_rt` 的操作。等价于 rui `spawn_blocking` 后把结果
+/// 送回 GUI 线程——因为 `MutableState` 写入只能在主线程运行时里进行。
+static MAIN_TASKS: Mutex<Vec<Box<dyn FnOnce() + Send>>> = Mutex::new(Vec::new());
+
+/// 把一个任务投递到主线程（GUI 运行时线程）执行。供后台线程回传结果。
+pub fn post_to_main(f: impl FnOnce() + Send + 'static) {
+    MAIN_TASKS.lock().unwrap().push(Box::new(f));
+}
+
+/// 排空主线程任务队列。`Kernel::frame` 在重组前调用——此时运行时 `RefCell` 借用尚未建立，
+/// 任务内可安全再入 `with_rt`（如 `MutableState::set`）。
+pub fn drain_main_tasks() {
+    // 取出整个队列（留下空 Vec）并立即释放锁，避免持锁期间运行回调（回调内可能再次 post_to_main）。
+    let mut tasks = std::mem::take(&mut *MAIN_TASKS.lock().unwrap());
+    for t in tasks.drain(..) {
+        t();
+    }
 }
 
 /// 当前组合作用域（浮层注册 / 动画帧驱动注册用）。

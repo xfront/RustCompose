@@ -21,7 +21,7 @@ fn many_item_dropdown_shows_scrollbar() {
                 let anchor = add_node(Policy::Leaf, Modifier::new().size(160.0, 40.0));
                 let open = mutableStateOf(true);
                 let items: Vec<String> = (0..30).map(|i| format!("Item {i}")).collect();
-                DropdownMenu(anchor, KEY, &items, open, |_| {}, true);
+                DropdownMenu(anchor, KEY, &items, open, true, |_| {});
             });
         });
     });

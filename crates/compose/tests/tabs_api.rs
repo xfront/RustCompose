@@ -43,10 +43,10 @@ fn tabs_renders_selected_page() {
             let tab = remember(|| mutableStateOf(1usize));
             Tabs(&titles,
                 tab,
+                Modifier::new(),
                 move | idx| {
                     Text(format!("page {idx}"), TextStyle::new(), Modifier::new());
                 },
-                Modifier::new(),
             );
         });
     });

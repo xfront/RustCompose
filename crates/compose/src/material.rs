@@ -300,9 +300,17 @@ impl LocalContentColor {
     }
 }
 
-/// 读取当前主题色（组合内）。
+/// 读取当前主题色。
+///
+/// 组合内走 `CompositionLocal`（含嵌套 `MaterialTheme` 覆盖）；**组合外的回调**
+/// （点击 / 悬停 / 绘制 / 输入路由）没有作用域栈，`CompositionLocal::current()` 会
+/// panic `CompositionLocal not provided`。此时回退到 `MaterialTheme` 每趟组合刷新的
+/// 全局镜像，语义合理且不会崩。
 pub fn theme_colors() -> ColorScheme {
-    LocalTheme::local().current().colors.clone()
+    LocalTheme::local()
+        .try_current()
+        .map(|d| d.colors.clone())
+        .unwrap_or_else(current_colors_global)
 }
 
 // ══════════════════════════════ 图标 ══════════════════════════════
@@ -1725,10 +1733,13 @@ pub fn glass_spec() -> GlassSpec {
     GlassSpec {
         enabled: true,
         blur: 16.0,
+        // tint 比初版减淡一档（暗 0.50→0.40、浅 0.40→0.34）：壁纸换成高饱和光斑后，
+        // 厚白/灰面纱会把颜色全压成牛乳——毛玻璃要「看得到背景」才像玻璃。
+        // 与 cpp `theme.cpp::glass_spec()` 同源（暗 0x6626262E / 浅白 0.34）。
         tint: if dark {
-            Color::rgba(0.15, 0.15, 0.18, 0.50)
+            Color::rgba(0.15, 0.15, 0.18, 0.40)
         } else {
-            Color::rgba(1.0, 1.0, 1.0, 0.40)
+            Color::rgba(1.0, 1.0, 1.0, 0.34)
         },
         highlight: if dark {
             Color::rgba(1.0, 1.0, 1.0, 0.30)

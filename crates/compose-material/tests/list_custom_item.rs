@@ -1,6 +1,6 @@
 //! 回归：`ListCustom` / `ListViewCustom` 支持自定义 item，且「整行（含自定义内容）点击选中」。
 //!
-//! 形如 Jetpack Compose：`ListCustom(count, |i| { 任意 widget }, selected, mod)`。
+//! 形如 Jetpack Compose：`ListCustom(count, selected, modifier, |i| { 任意 widget })`。
 //! 行外壳（整行点击选中 + `secondary_container` 高亮）由 `list_row` 统一提供，
 //! 故点击自定义内容（图标/文字/副标题）或左右 padding / 上下留白都归属同一行。
 
@@ -67,12 +67,12 @@ fn boot(with_scroll: bool) -> (NodeId, MutableState<usize>, f32, f32) {
             if with_scroll {
                 ListViewCustom(
                     N,
-                    custom_item,
                     sel,
                     Modifier::new().fill_max_width().height(200.0),
+                    custom_item,
                 );
             } else {
-                ListCustom(N, custom_item, sel, Modifier::new().fill_max_width());
+                ListCustom(N, sel, Modifier::new().fill_max_width(), custom_item);
             }
         });
     });
@@ -108,16 +108,25 @@ fn abs_rect(id: NodeId) -> (f32, f32, f32, f32) {
     })
 }
 
-/// 所有行外壳节点（带 on_click 的整行 Box）。
+/// 所有行外壳节点（带 on_click 的整行 Box），按纵向位置自上而下排序。
+/// 排除 `focusable_full` 焦点容器：它同样挂 on_click（空处理器）但带 key_handler，
+/// 不是行外壳；真实行外壳只有 on_click、无 key_handler。
+/// 按 y 排序而非 arena 下标：重组会重排节点分配顺序，下标序不等于逻辑行序。
 fn rows() -> Vec<NodeId> {
-    with_rt_pub(|rt| {
+    let mut rs: Vec<NodeId> = with_rt_pub(|rt| {
         rt.nodes
             .iter()
             .enumerate()
-            .filter(|(_, n)| n.alive && n.on_click.is_some())
+            .filter(|(_, n)| n.alive && n.on_click.is_some() && n.key_handler.is_none())
             .map(|(i, _)| NodeId(i as u32))
             .collect()
-    })
+    });
+    rs.sort_by(|a, b| {
+        let ya = abs_rect(*a).1;
+        let yb = abs_rect(*b).1;
+        ya.partial_cmp(&yb).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    rs
 }
 
 fn click_at(root: NodeId, x: f32, y: f32) -> bool {

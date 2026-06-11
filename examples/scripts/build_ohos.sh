@@ -5,13 +5,13 @@
 # 用法：
 #   export OHOS_NDK_HOME=/path/to/ohos-sdk/native
 #   ./scripts/build_ohos.sh [example_name]
-#   ./scripts/build_ohos.sh gallery
+#   ./scripts/build_ohos.sh story
 #
 # 依赖：OHOS NDK（含 llvm 工具链）+ rustup target add aarch64-unknown-linux-ohos
 
 set -e
 
-EXAMPLE=${1:-gallery}
+EXAMPLE=${1:-story}
 OHOS_NDK=${OHOS_NDK_HOME:?"OHOS_NDK_HOME not set. Please set it to the OHOS NDK path (e.g., /path/to/ohos-sdk/native)"}
 
 TARGET="aarch64-unknown-linux-ohos"

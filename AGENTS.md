@@ -1,6 +1,6 @@
 # 2026-10-30
 
-## RustCompose 初始化（Jetpack Compose 架构 GUI 库）
+## compose-rs 初始化（Jetpack Compose 架构 GUI 库）
 - 用户明确：基础库 winit 0.30 + valo 0.18 + wgpu 30（valo 非 vello，类 Impeller 引擎；实际解析为 rsproxy 的 valo-dl-0.13.1）；架构严格按 Jetpack Compose；目标全平台（第一阶段 desktop + 代表性控件）。
 - 硬约束：零 Rc/Arc/unsafe → 节点/状态/作用域/任务全 arena 化（u32 句柄），回调用 take-put 防重入。
 - 产出：crates/compose（runtime 槽位重组/remember/derivedStateOf/CompositionLocal/effects/动画 + layout 三阶段 + material 组件）+ crates/compose-desktop（valo 渲染管线）+ counter 示例。
@@ -217,3 +217,277 @@
 
 ### 文档全面校正（README.md 对齐当前代码）
 - README 长期滞后于代码，本轮按现状逐项校正：①渲染管线 valo 0.9→**0.18**（Cargo.toml 实值）；②顶部示例旧 API `column(c,…)`/`remember(c,…)` → 现代 PascalCase 无 `&mut Composer` 首参（`Column(…)/Text(…)/Button(…)/remember(||…)`），架构表 `@Composable` 行同步；③示例入口 **gallery→story**（全文：运行/跨平台构建/build_apk/已知限制），移除已废弃的 `--dark` 启动参数（现由 Theme 菜单运行时切），补 `STORY_PAGE=<下标|页名>`；④gallery 7 页描述 → story 103 页 / 7 分组（Demos/Basics/Data Display/Layout/Navigation/Feedback/Advanced）；⑤侧栏 `GROUPS` 名与 story 对齐；⑥液态玻璃函数 snake_case→PascalCase（`ToggleLiquidGlass`/`SetLiquidGlass`/`glass_spec()` 无参/`LiquidGlassWallpaper(colors)`）；⑦浮层宿主 `OverlayHost/Overlay/RememberOverlayKey` 去 `c` 参；⑧控件模块表补 `chart.rs`/`grid_sheet.rs`/`rich_text_editor.rs`（实际 13 模块）；⑨菜单栏 Theme 补种子色板 `THEME_PRESETS`+`ColorScheme::from_seed`。AGENTS.md 为历史日志，保留旧记录原样，仅追加本会话新条目。
+
+## 2026-11-09 examples/story.rs 拆分为多文件模块
+
+### 拆分结构
+- 动机：`examples/story.rs` 单文件 5710 行 / 156 个顶层项，改任一页都要在 5.7k 行里定位，维护成本高。
+- 入口与模块声明留在 `examples/story/main.rs`（151 行，含内联的无头探针 `probe_state` / `probe`），实现拆到同目录：
+  - `story/prelude.rs`（35 行）——原文件顶部 `use` 列表整体搬入并改写为 `pub use`，各模块经 `use crate::prelude::*;` 引入（免逐模块重复、保持「改一处即全应用」）；
+  - `story/shell.rs`（534 行）——应用外壳：主题 / 标题栏 / 菜单栏 / 侧栏 / 状态栏 / 页面容器；
+  - `story/common.rs`（77 行）——跨分组共用：`section` / `card_section` / `nav_items` / `nav_sections` / `thread_local`（`MENU_ANCHORS` + `SNACK_HOST`）；
+  - `story/pages/mod.rs`（303 行）——`PAGES` 注册表（标题/图标/说明/渲染函数唯一真源）+ `build_page_body` / `build_page_title` + 7 个分组子模块声明；
+  - `story/pages/{demos,basics,data,layout,navigation,feedback,advanced}.rs`——按 `PAGES` 的 7 分组归置（demos 2497 行含动画 helper，data 730 行，其余 210~430 行）。
+- `examples/Cargo.toml`：example 入口改 `path = "story/main.rs"` + 加 `autoexamples = false`（example 位于子目录，关闭自动发现避免重复目标）。原 `examples/story.rs` 已删除。
+
+### 拆分方法与踩坑（可复用经验）
+- **不要手工搬运 5.7k 行**：用一次性脚本按「顶层项」切片重组——定位第 0 列声明行（fn/struct/impl/const/mod/use/thread_local!）与 `#[...]` 属性行，块 = [块起点, 下一块起点-1]；属性行并入所属项后回溯截断上一块结束行，保证每行恰好归属一块（不重不漏）。
+- **坑① 函数体内缩进的 `#[cfg(test)]`**（`story_shell` 内的探针块）会被误判为顶层属性 → 属性检测必须限定第 0 列，否则会凭空多出「声明项」并切坏函数体。
+- **坑② 注释上吞会与上一块重叠** → 上吞 doc 注释后必须把上一块结束行截断到本块起点-1；否则同一段注释在相邻两模块各出现一次（曾致 prelude.rs 尾部悬空 doc 注释 → `expected item after doc comment`）。
+- **坑③ 批量提可见性时正则吞类型** —— 字段提 `pub(crate)` 用 `re.sub(r'^(    )(\w+):', r'\1pub(crate) \2:', l)` 只替换前缀；直接重写整行会把 `&'static str` 等类型删掉。
+- **坑④ 跨模块引用须显式导入** —— `probe_state` 是 crate 根的 `#[cfg(test)]` 模块，shell 侧需 `#[cfg(test)] use crate::probe_state;`；`nav_items` / `nav_sections` 被外壳侧栏与 NavigationRail 页共用 → 下沉 `common.rs`；`common.rs` 又需 `use crate::pages::{GROUPS, PAGES};`。
+- prelude 的 `use` 必须写 `pub use`，否则 `use crate::prelude::*` 拿不到任何名字（表现为大批 `cannot find type`）。
+- 模块间循环引用合法：`pages/mod.rs` → `use crate::shell::page_group;`，shell → `use crate::pages::{GROUPS, PAGES, build_page_body};`。
+
+### 验证
+- `cargo build --example story` 通过（0 error；拆分未引入新警告，唯一 `Tabs` 命名风格警告为既有）。
+- `cargo test --example story` 通过：`probe::menu_dropdown_flow ... ok`。
+- 实跑 `target/debug/examples/story` 正常：GPU 适配器就绪、64 字体加载、无 panic。
+- 脚本自检：切分 5705/5711 行，未覆盖的 6 行即原模块文档头（已在 main.rs 复现）。
+
+## 2026-11-18 Docking 对齐 VS2022（指南拖放 / 标签插入 / 自动隐藏 / 浮动 / 上下文菜单）
+
+- 拖放判定从「矩形五区盲判」改为 **VS 指南命中**：`DockGuide::{Inner{target,dir},Outer{dir},Tab{lead,index}}` + `dock_inner_guides/dock_outer_guides/dock_guide_hit`（±DOCK_GUIDE_PAD）。只有南针/外圈/标签条是落点；无指南=取消、窗外=浮动。旧 `dock_direction_in_rect/dock_preview_rect` 保留（测试仍用）。
+- 标签条：文档井顶部 2px 主色 accent、悬停才显关闭、pin/▼/× 按钮组、超宽折行省略（`measure_text_with_measurer`）、溢出 chevrons 走引擎新增 `scroll_by/scroll_metrics`（`HorizontalScroll/VerticalScroll` 改返回 NodeId）。拖到别组标签条显**插入光标**（竖线+上下三角）+ 条高亮。
+- 自动隐藏：竖排标题边条；点击滑出**贴边整条 peek**（侧边=全高×clamp(宽*0.30,240,420)，顶底=全宽×clamp(高*0.32,180,360)），`animate_progress_on(id,Tween(0.18))` 滑入；peek 标题竖放图钉=钉回。
+- 浮动窗：两层软阴影 + 八向缩放手柄 + 双击标题回 dock + 拖标题回主窗口指南重新停靠。**阴影坑**：全屏 `Canvas(fill_max_size)` 绝对坐标画阴影在浮层重组时残留旧位（窗上方灰块）；改为与窗框同 offset 落位路径的 `background(BLACK alpha)` 节点（`no_hit`）即逐帧同位。教训：浮层投影别用全屏绝对坐标 Canvas，用与主体同落位路径的底色节点。
+- 上下文菜单 VS 项：关闭/关闭其他/全部关闭（组>1 才显）/分隔/浮动为窗口/自动隐藏/最大化；宽 190、行 32、分隔 9。不可关闭面板（解决方案资源管理器）菜单无「关闭」——非缺陷。
+- 引擎/导出：`lib.rs` 根 re-export 是**选择性列表**，新增 pub API 必须同步加进去（否则 examples E0425）；本轮补 DockGuide/dock_*_guides/dock_guide_hit/DOCK_GUIDE_*/DOCK_TAB_MAX_W。
+- 测试修正：①玻璃菜单宽 180→190；②peek 改贴边整条后旧「两个全尺寸玻璃面」断言过时，改为泵帧（advance_frame+layout+draw ×24）等滑入到位再断言边条尺寸（首帧根未测量 dock_layout_rect=0 属正常）；③`list_custom_item.rs` 的 `rows()` 误把 `focusable_full` 焦点容器（空 on_click+key_handler）计为行、且按 arena 下标序（重组会乱）→ 过滤 `key_handler.is_none()` + 按 abs y 排序。属焦点系统遗留测试缺陷，非本轮回归。
+- GUI 验证工具（D:/rc-target，不进仓库）：`capture.ps1`(PrintWindow 2)、`drag.ps1`(左键拖)、新增 `drag_preview.ps1`(按住不放供截屏)、`rclick.ps1`(右键)。**截屏必须在同一 bash 命令内「启动拖拽&→sleep→capture→wait」**，跨工具调用的间隔延迟会让 hold 提前结束、截到释放后画面。慢拖（steps40×100ms）才能截到移动中的指南/光标/幽灵。
+- 验证：docking/dock_layout/dock_contract 54 项全绿；compose、compose-material 全量 --tests 全绿；examples check 无 error；实跑截屏确认 浅色/暗色 VS 工作区、罗盘+外圈+幽灵+预览、标签插入光标、自动隐藏边条+滑出 peek、上下文菜单、浮动窗+正确阴影、拖浮窗回指南（脱靶=取消正确）。
+
+## 2026-11-18（续）修复分割条拖拽「串层」：拖下方分割条却改右侧比例
+- 用户报：拖下方 Dock 分隔条，变动的却是右边 Dock 的分隔大小。
+- 根因（`docking.rs` `set_ratio_by_path`）**path 语义 off-by-one**：render 侧 `splitter_path = 分割节点自身 path`（根=`[]`、右=`[1]`、下=`[1,0]`），但旧 `set_ratio_by_path` 在 `path.len()==1` 时就写**当前**节点比例（只导航 len-1 步）→ 下`[1,0]`导航到右分割 B 后写 B（串层）；右`[1]`写根（改左栏宽）；根`[]`被 `is_empty return` 直接忽略（根分割条拖不动）。
+- 修复：改为「沿整条 path 走到目标分割节点再写比例；空 path=当前节点」。即 `if path.is_empty(){*r=ratio;return;} let child=if path[0]==0{first}else{second}; recurse(child,&path[1..])`。三个层级（根/右/下）各自隔离。
+- 测试：`docking.rs::set_split_ratio_only_touches_addressed_level` 旧断言用 `[1,1]` 寻址内层（对着 buggy 实现写的多余尾元素）→ 改为节点自身 path `[1]`，并补「拖根 `[]` 只改外层、内层保持」双向隔离断言。
+- GUI 实测（drag.ps1 + capture.ps1）：下分割条 (500,620)→(500,700) 只改文档/输出高度、右边界 x≈890 不动；右分割条 (890,400)→(800,400) 只改中/右宽、下分割 y 不动；根分割条 (231,400)→(330,400) 只改左栏宽（中+右按 B 比例同步缩）、下分割 y 不动。**根分割条仅 4px（DOCK_SPLITTER_PX），x=228 会落在侧栏滚动条 gutter 上拖不动，须 x≈231 命中**。
+- 验证：docking/dock_layout/dock_contract 全绿；compose-material 全量 --tests 全绿。
+
+# 2026-11-24 Jetpack Compose 架构对齐专题（本会话）
+
+## 用户约束
+- **后续只验证 desktop**（不再逐端跑 wasm/android）。本会话所有验证均为 `cargo test --workspace --tests` + `cargo check --example story -p examples`。
+- 主题：逐项对齐 Jetpack Compose 核心架构，并在 story 中提供可交互演示。
+
+## 本轮新增核心模块（compose）
+- `slot_table.rs` — SlotTable gap-buffer：线性 `Vec<Slot>`（Group/Data/Gap）+ 可搬移 gap（原地 `rotate`，不 Clone `Box<dyn Any>`）+ group 头/Anchor + `truncate_data` 回收；`ScopeData.slots: Vec` → `SlotTable`，`remember/keyed_remember/launched_effect/disposable_effect` 全部改 `get_data/set_data`。`run_scope` 未启用 truncate（保持位置身份兼容）。
+- `applier.rs` — `NodeApplier` trait（对齐 Compose `Applier<N>`）+ `ArenaApplier` + 线程局部可替换实现；`add_node` / `run_scope` 摘子树 / `dispose_scope_rt` / `sweep_nodes` 四处树变更收口；新增 `move_node`。**关键坑**：`clear/remove` 必须保留子节点 `parent` 字段（GC 可达性安全网），初版置 None 导致 `list_custom_item` 回归。
+- `snapshot.rs` — 快照栈 + 隔离写集合 + 读缓存 + read/write observer + `SemanticsTree` 无关；`MutableState::{get, read_clone, read_unregistered, set, update}` 接入快照读/写；`apply_snapshot` 在 runtime 提交并失效。嵌套快照读缓存语义：外层已缓存的值不受内层 apply 影响。
+- `modifier_node.rs` — `ModifierNodeImpl` + arena 节点 + `ModElem::Node` + `Modifier::{with_node, node_ids}` + 公开 `then/then_if`（原私有 `then(ModElem)` 改名 `push_elem`）；measure/draw 两阶段按链序调用。`CompositionLocal` 读取依赖确认不注册（Compose 语义正确）。
+- `gesture.rs` — 统一 `PointerEvent{type,x,y,dx,dy,time_ns}` + `PointerInput` 组合函数（按 NodeId 注册 handler，沿祖先链派发）+ `detect_tap_gestures`（tap/double/long，8px slop）+ `detect_drag_gestures`（touch slop）；`dispatch_press_down/up` 派发 Press/Release，新增 `dispatch_pointer_move`。
+- `semantics.rs` — 类型化 `SemanticsPropertyKey<T>` + 标准属性 + `Role`/`SemanticsAction` + `SemanticsConfig` + arena `SemanticsNode`/`SemanticsTree`（查询/命中/焦点/perform/JSON）+ `build_tree`（显式 > 派生 > DrawCmd::Text，merge/clear/hidden）；`Modifier::{semantics, content_description, test_tag, role, merge_descendants, clear_and_set_semantics, hide_from_accessibility}`。**坑**：`build_tree` 必须写入线程局部 TREE 供 `with_tree` 读；`node_absolute_bounds` 与 `with_rt_pub` 不能嵌套（RefCell 重入）。
+- `subcompose.rs` — measure 期请求队列 + `MeasureCtx::subcompose(slot, content)`；`perform_layout` 改两趟（measure 收集 → 无借用期 `subcompose_scope` keyed 组合 → 重测反馈），上限 8 轮。`runtime::subcompose_scope` 临时压入父 scope/node 栈复用 `emit_keyed_scope`。
+- Effects 完善：`TaskSlot.owner` + 作用域销毁取消协程（`spawn_task` 需在借用外取 owner，否则嵌套借 panic）；真正 `SideEffect`（post-recompose 队列，`recompose_pending` 每批后 + `set_content` 末尾 drain）；`rememberUpdatedState` / `snapshotFlow`（derivedStateOf 复用）/ `producedState`。
+- GraphicsLayer：`DrawCmd::{SaveLayer, Transform, Restore}` + Hash 22/23/24 + `is_clip` 归状态栈（不进静态块）+ `Modifier::{graphics_layer, alpha, rotate, scale}` + valo `save_layer` 映射（Transform 暂降级 no-op，valo 0.13 无 builder 级变换）。
+
+## compose-material 新模块
+- `transition.rs` — `AnimatedVisibilityEx`（Enter/Exit 生命周期，exit 进度归零后下一轮重组 dispose 内容）+ `AnimatedContent`（`animate_progress_on(key)` 重播入场）+ `VisibilityTransition`/`ContentTransform`；走 `Modifier.graphics_layer`。**坑**：不能用 `animations_active()` 判断收敛（读即清 FRAME_REQUEST）；不能嵌套 `move` 闭包传 content（E0507），直接把 content 传给 LayoutBox。
+- 虚拟列表 `lazy_list.rs` 加 `selected: MutableState<usize>`，点击整行 `secondary_container` 高亮（行节点挂 on_click，点击 padding 亦归属该行）。
+- RichTextEditor 文本拖选：`on_press` → `click_to_caret` 建 anchor + `begin_drag_2d` → `drag_to_caret` 保留 anchor 扩选；`on_click` 留空避免重复定位清锚点。
+- Docking：拖拽入口收窄到 tab / tab 条同一行，移除面板内容区 `on_press`（内容拖动不再触发 DnD 提示）。
+
+## 平台 / 构建 / 网络
+- Android：入口下沉引擎层 `compose::platform::android::android_main` + 应用层 `compose_create_app_root` 注入，最终 `.so` 由 examples `story_android` cdylib 链接（对齐 cui `cui_core`/`examples` 分层）；Manifest 须 `android:hasCode="false"` + .so STORED 16KB 对齐；字体扫 `/system/fonts`（Roboto/DroidSansFallback）。
+- `platform/services/network.rs`：`TcpStream` HTTP/1.1（http:// GET/POST），移动端经 channel；Android Manifest 加 INTERNET 权限。
+- wasm32 `Instant` 用 `web_time` cfg 别名（winit `ControlFlow::WaitUntil` 类型匹配）。
+- 构建脚本：`build_cross.sh` / `build_web.sh` / `build_android.sh` / `build_apk.sh` 全部从已删除的 gallery 改 story。
+
+## story 演示（现 112 页 / 8 分组）
+- 新增 `pages/compose_alignment.rs` 8 页：SlotTable / Applier / Snapshot / Effects / Modifier.Node & GraphicsLayer / Subcompose & Semantics / pointerInput 手势 / AnimatedTransition。
+- `PAGES` + `GROUPS`（Compose 对齐 104..112）+ 探针 `compose_alignment_pages_render_without_panic` 逐页渲染。
+- **坑**：Effects 页的 SideEffect 不能写会触发自身重组的 state（无限循环）→ 用 `Rc<Cell>` 计数（示例层允许 Rc）。
+
+## 验证
+- 每步 desktop 全量测试无失败；新增单测/集成测试：slot_table 7、applier 6、snapshot 4+5、effects 5、gesture 4+4、semantics 7、graphics_layer 3、modifier_node 3+2、subcompose 3、transition 集成 4。
+- 文档：README.md 架构表、模块清单、对齐边界、页数、验证策略全部同步；本文件追加本条。
+
+# 2026-11-24 视频播放（参考 /work/study/cui/rui_packages/src/video.rs）
+
+## 用户约束
+- 仍只验证 desktop；不逐端跑 wasm/android。
+- 要求参考 cui 的 `video.rs` 实现视频播放（来源探测 / 后端表 / FFmpeg 解码 / 状态机 / 控制器 / 控件族）。
+
+## 实现要点
+- `crates/compose-material/src/widgets/video.rs`：数据层（`VideoSource/VideoInfo/VideoFrame/AudioChunk`）+ 后端 trait/目录/偏好/能力 + `VideoPlayback` 状态机（媒体时钟、seek、循环、倍速、音量）+ `VideoPlayerController` + Composable（`Video`/`VideoControls`/`VideoPlayer`）+ `MockVideoBackend`。
+- 帧管线：解码线程按 PTS 与墙钟对齐产 RGBA → **单槽 `Arc<Mutex<Option<VideoFrame>>>` 邮箱**（新帧覆盖旧帧，天然有界）→ 主线程帧驱动 `on_frame()` 逐帧 `next_image_id()` + `image_cache::submit_decoded` + `drop_image(prev)` → `Canvas` 闭包 emit `DrawCmd::Image`。视频控件自身帧驱动随作用域销毁自动注销，播放时 `request_anim_frames()` 续帧。
+- 控制器是 `Clone` 共享句柄；`Drop` 必须用 `Rc::strong_count(&self.worker)==1` 判断是否最后一个句柄，否则任一临时 clone 被丢弃就 dispose 会话并清空帧槽（曾导致集成测试看不到 `DrawCmd::Image`）。
+- `VideoPlayerValue` 用 `MutableState`（Copy 句柄）承载，seek/initialize/volume 乐观写 `cmds`，不等解码线程下一拍；`VideoProgress` draw 闭包用 `peek_mut` 无注册读，避免绘制期注册依赖。
+- 音频：FFmpeg 后端能探测音轨（`has_audio_stream`），但工程无音频输出后端，播放静音（与参考的 FFmpeg 后端边界一致）。
+
+## 构建与 FFmpeg
+- `crates/compose-material/build.rs` + `csrc/ffmpeg_shim.c`：探测 vcpkg（`FFMPEG_DIR`/`VCPKG_*`，优先 `x64-linux-dynamic`）→ pkg-config 兜底，编译 C shim 并输出 `cfg(compose_ffmpeg)` 与链接参数；非桌面直接跳过。本机已探测到 vcpkg FFmpeg 7（libavcodec 63），真解码可用。
+- C shim AVIO 所有权：自定义 AVIO 在 `avformat_open_input` 失败后不能再释放 `io/io_buffer`（FFmpeg 可能已回收），用 `io_owned` 标记区分；未修复前用 PNG 内存源失败路径会 `double free` SIGABRT。
+- 失败路径测试：`ffmpeg_invalid_memory_source_fails_cleanly`；真解码用内存/文件 GIF（`ffmpeg_backend_decodes_{memory_bytes,real_bytes}`），PNG 单帧在 FFmpeg 7 的 `png_pipe` 探测下无法定尺寸，不作为测试用例。
+
+## 验证（desktop）
+- `cargo test --workspace --tests` 全绿；`cargo check --example story -p examples` 无 error。
+- story 新增 113 页 / 9 分组：`Video` 页默认 Mock 播放，可原生对话框打开本地视频；`main.rs` 探针按页名加入 "Video"；`prelude.rs` 注释同步 113 页。
+- 测试：`video.rs` 单测 6 + 集成 5（含 FFmpeg 真解码 3 项，均 gated `cfg(compose_ffmpeg)`）。
+
+## 2026-11-24 修复 release story 找不到 libavformat.so.63
+- 现象：直接运行 `target/release/examples/story` 报 `libavformat.so.63: cannot open shared object file`；debug 单测正常。
+- 根因：`compose-material/build.rs` 的 `cargo:rustc-link-arg=-Wl,-rpath,...` **不会跨包传播**到 `examples` 包的 example 目标；`cargo check` 不链接所以此前未暴露。release 二进制只有 `NEEDED libav*.so`，没有 `RPATH/RUNPATH`。
+- 修复：新增 `examples/build.rs`，按 `FFMPEG_DIR` / `VCPKG_INSTALLED_DIR` / `VCPKG_ROOT/installed/*` / pkg-config 探测含 `libavformat.so*` 的目录，对该包目标发 `cargo:rustc-link-arg=-Wl,-rpath,<dir>`；Linux 额外加 `--disable-new-dtags` 生成 `DT_RPATH`（间接依赖也覆盖），macOS 跳过该开关；非 linux/macos 直接返回，不影响 wasm/android。
+- 验证：`cargo build --release --example story -p examples` 后 `readelf -d` 显示 `RPATH [/tools/dev-cache/vcpkg/installed/x64-linux-dynamic/lib]`，`ldd` 全部解析到该目录，启动无加载错误。
+
+## 2026-11-24 修复 VideoProgress measure 期 RefCell 重入
+- 现象：运行 story 进视频页 panic `runtime.rs:200 RefCell already borrowed`，栈为 `VideoProgress::{closure#0}::{closure#0}` → `measure_node` → `measure_row_col`。
+- 根因：`Canvas` 的 draw 闭包不仅绘制时调用，`leaf_intrinsic` 在 measure 期会用 `DrawBuilder::probe()` 调一次；此时 `measure_node` 已持有 `RUNTIME.borrow_mut()`。进度条旧闭包用 `c_draw.value.peek_mut(...)`，内部 `with_rt` 再次 `borrow_mut()` 即 panic。
+- 修复：进度条 draw 闭包改为直接读控制器共享的 `cmds.position_us`（`AtomicI64`）和 `info.duration_us`（`Mutex<VideoInfo>`），不碰 `MutableState` / runtime；既不重入也不注册组合依赖。
+- 回归：集成测试 `decoded_frame_is_drawn_as_image` 由只组合 `Video` 改为组合完整 `VideoPlayer`（含 `VideoControls` → `VideoProgress`），覆盖 measure 期预探测；`cargo test -p examples --example story` 的 `compose_alignment_pages_render_without_panic`（含 "Video" 页）通过。
+
+## 2026-11-24 修复 story「打开文件」后不播放
+- 现象：选择本地文件后画面/状态无变化。
+- 根因链：`open_file_dialog` 的回调**已在主线程**（`file_dialog.rs` 内部先 `post_to_main`）；旧 story 页又在回调里二次 `post_to_main` 投递路径，并且**提前**把 `wait` 原子标志清成 false。`Kernel::frame` 里 `advance_frame`（帧驱动）在 `drain_main_tasks` **之前**：帧 N 的驱动看到 wait=false 不再 `request_anim_frames()`，回调随后才把路径投递出去；此时宿主无待渲染帧，路径永远停在 channel 里。
+- 修复：回调里直接 `tx.send(path)`（同线程）并补一次 `request_anim_frames()`；`wait` 只在帧驱动**真正消费并处理完路径**后清除，取消对话框时才在回调里清除。另外 Mock 演示源改为创建后立即 `play()`（此前文案说默认播放但实际未播放）。
+- 可观测性：新增 `VideoPlayerController::open_with_error(VideoSource) -> Result<Self, String>`（`open()` 仍返回 Option），story 状态栏回显「打开 xxx 失败：原因」与解码错误；文件过滤器补 ts/flv/m4v 与「所有文件」。
+- 验证：`video.rs` 集成测试增 `open_with_error_reports_reason`（6 项全过）；workspace 全量测试 + release 构建均通过。
+
+## 2026-11-24 修复选文件后「不停闪」且仍不播放（真正根因）
+- 现象：上一条修复后仍不播放，页面不停闪。
+- **真正根因**：`page_video()` 是组合体，视频页每帧因时钟/进度状态重组。旧代码在组合体里直接 `let (tx, rx) = channel()` 且 `let rx = remember(...)`：remember 留住**首次** Receiver，而每次重组拿到的 `tx` 都是**新建 channel** 的 Sender —— 新 Sender 发往已被丢弃的 Receiver，`send()` 静默失败，路径永远收不到。同时每次重组都直接 `add_frame_driver(...)`，帧驱动不断累积且都看到 `wait=true`，每帧反复 `request_anim_frames()` → 看起来就是「不停闪」。上一条只修了 wait 清除时机，没修身份不稳定。
+- 修复：把 `(Sender, Receiver)` 作为一个整体放进 `remember`（`Rc<(Sender, RefCell<Receiver>)>`），帧驱动注册也放进 `remember`，两处身份在重组间稳定；按钮闭包从同一个 `channel.0.clone()` 取 Sender。
+- 回归：`examples/story` 新增 `video_page_recomposition_does_not_grow_frame_drivers`：进入 Video 页后连跑 12 帧，`frame_driver_count()` 必须与首帧相等（旧实现会持续增长）。现 14 项 story 探针全过。
+- **教训**：本工程 `remember` 是「位置即身份」，但只保留**首次求值的返回值**；任何在组合期创建并需跨重组存活的资源（channel、frame driver、dialog handle）都要整体包进 `remember`，不能「对象每次新建、只把一半 remembered」。
+
+## 2026-11-24 修复点击按钮后文本要移开鼠标才刷新
+- 现象：SlotTable 演示页点「追加 slot」，上方统计文字不动；鼠标离开按钮后才更新。
+- 根因：演示把表放在 `Rc<RefCell>`，另设 `rev = mutableStateOf(0u32)`，按钮里 `add_r.update(...)`；但**组合期没有任何作用域读 rev**。Compose 定向重组只会失效「读到该 state 的作用域」，无读者 ⇒ 不重组。宿主在 mouse-up 时虽 `request_redraw()`，但该帧无 pending 重组，Text 闭包仍是旧字符串；鼠标移动改变 hover 状态后才顺带重组刷新。
+- 修复：在读取表格数据的 Column 作用域里 `let _ = r.get();` 注册依赖。按钮 `update` 立即失效该作用域并重组。
+- 回归：`examples/story` 新增 `slot_table_button_click_recomposes_without_pointer_move`：找到「追加 slot」文字坐标→`click`→`recomp`（**不调用 pointer_move**）→断言统计文本变化。临时删掉修复行后该测试确实失败（`left == right`），恢复后通过。
+- **通用规则**：演示里用 `Rc<Cell/RefCell>` 做非响应式探针时，必须配一个**在组合期被 `.get()` 读取**的 rev state，否则写它不会重组；`let _ = r;` 只是移动句柄，不算读取。已审计其余 compose-alignment 页均有对应 `.get()`。
+
+# 2026-11-24 C++20 协程版 Jetpack Compose（cpp/）
+
+## 调研结论
+- `/work/study/cui/cui_core` 是 Flutter 风格三树引擎（Widget/Element/RenderObject + BuildOwner + PipelineOwner），**不是** Compose：无 SlotTable/Applier/Snapshot/Compose Modifier，可复用的是分层骨架与脏调度思想。`/work/study/compose-rs/cpp` 原先只有两个空目录。
+
+## 实现
+- 新建 CMake 工程 `cpp/CMakeLists.txt`（C++20，静态库 `compose_runtime` + `compose_tests`）；头文件在 `cpp/compose/include/compose/*.h`，实现在 `cpp/compose/src/*.cpp`（slot_table/state/applier/coroutine/composer），测试 `cpp/examples`。模板/内联留在头文件，非模板实现全部迁到 src。
+- `slot_table.h`：gap buffer（逻辑→物理映射必须走 `gap_end_`，删除圈回 gap、插入复用）。
+- `state.h`：`State/MutableState`、`mutableStateOf`、读注册依赖、写变化才失效、`Snapshot` 隔离写 + `apply()`。
+- `applier.h`：`Applier/ArenaApplier` + 线程局部 `current_applier` + 祖先链 `dispatch_click`；后续已去掉 `NodeArena`，改为 `LayoutNode` 对象树 + `cui::SharedPtr`。
+- `composer.h`：`Scope/SlotTable slot_cursor/Recomposer`、`Composition`、`remember`、`LaunchedEffect(key, factory)`。
+- `coroutine.h`：`Task` promise_type（初始挂起，由 `EffectScope::add` 设置归属后恢复）、单线程虚拟时钟 `Scheduler`、`Delay/NextFrame`、`EffectScope::cancel()` 通过 `await_resume` 抛 `Cancelled` 收敛。
+- `modifier.h` 值链 + `widgets.h` 的 `Text/Button/Row/Column`（节点身份由 `remember<NodeId>` 稳定，重组只更新 payload）。
+- `cpp/examples`：gap 复用、有/无读者的重组调度、Snapshot、协程 effect 取消重启、applier 拦截，6 项全过。
+- `cpp/README.md` 记录构建、对齐表与边界（无渲染/平台层；无编译器插件）。
+
+## 验证
+- `cmake -S cpp -B cpp/build -DCMAKE_BUILD_TYPE=Release && cmake --build cpp/build -j4 && ./cpp/build/compose_tests` 通过。
+
+## 2026-11-24 续：Skia + X11 可用界面 + 严格对齐布局
+- 用户补充：底层实现可参考 `/work/study/cui`，架构严格对齐 Jetpack Compose。
+- **Skia 来源修正**：本机 Skia 在 `/tools/dev-cache/vcpkg/installed/x64-linux-dynamic`（不是 /work/study/vcpkg）；CMake 从 `$VCPKG_ROOT/installed/x64-linux-dynamic` 追加 `CMAKE_PREFIX_PATH`，`find_package(unofficial-skia CONFIG)` + `unofficial::skia::skia`。
+- 新增 `cpp/skia_app/`：`X11Window`（XCB 建窗/事件/WM_DELETE/`xcb_put_image` blit，参考 cui `x11_window.cpp` + `app_window.cpp`）、`SkiaSurface`（`SkSurfaces::Raster(N32Premul)` + `peekPixels`）、`ComposePainter`（fontconfig + `SkFontMgr_New_FontConfig`，参考 cui `Painter`）、`demo/main.cpp`。
+- **运行坑**：vcpkg `libskia.so` 把 webp/jpeg/png/harfbuzz/icu/freetype/z 留作外部符号；须 `find_library` 后用 `-Wl,--no-as-needed ... -Wl,--as-needed` 保活，否则运行报 `undefined symbol: WebPPictureImportRGBX` / `jpeg_resync_to_restart`。RPATH 指向 vcpkg lib 目录。
+- **协程坑**：`LaunchedEffect` 的 factory 若用 `[&]` 捕获状态，临时 lambda 销毁后引用悬空（gdb: `State<int>::read_unregistered(this=0x0)`）；改为 `[tick]() mutable` 按值捕获可 Clone 的状态句柄。
+- 架构对齐：新增 `compose/include/compose/layout.h` + `src/layout.cpp`：`Constraints`（loose/tight/constrain）、`MeasurePolicy`、`Placeable`、`MeasureResult`、两阶段 `measure_node`、`set_text_measurer`（渲染层注入字体度量）。`Node` 增加 `layout_data`。`Row`/`Column` 策略含 padding；`Composition` 根节点默认 `measure_column`。`ComposePainter` 不再自行布局，改为 `measure_node(root, Constraints)` → 递归收集 `Placeable` → 绘制/命中；hit_test 按布局顺序反向确保 z 序。
+- 测试：新增 `test_constraints_and_measure_policy`；7 项 C++ 测试全过；`compose_skia_demo` 在 `DISPLAY=:0` 下运行 3 秒无崩溃（timeout 124 正常终止）。
+- 后续：控件层拆到 `cpp/compose-material/`（`include/compose_material/widgets.h` + `src/widgets.cpp`，静态库 `compose_material`），新增 `Card/Checkbox/Switch/Slider/TextField` 及 Skia 绘制/点击；`Slider` 用 `onClickPos(local_x, node_width)`。
+- 用户要求去掉 `NodeArena` 与 `std::shared_ptr`：改用 `LayoutNode` 对象树；所有权用 `cui::SharedPtr`（复制到 `cpp/compose/include/compose/shared_ptr.h`，非原子计数，单线程），父链用裸指针（树所有权自上而下）；`Scope/EffectScope` 也用 `cui::SharedPtr`，状态读者与 Recomposer dirty 用裸 `Scope*`；`cui::make_shared` 替代 `std::make_shared`。外部 include 路径依赖已移除。全量编译/7 项测试/Skia 演示均通过。
+- 边界：`Modifier.Node` 尚未进入 measure/draw 链；Subcompose/Semantics/手势/动画未移植；Skia 层未接 cui 完整 RenderObject/PipelineOwner。
+
+## 2026-11-24 续：C++ examples/story 对齐 Rust 版
+- 用户要求「增加 examples 示例，对齐 rust 版」。`cpp/examples/` 原为空目录。
+- 先摸清 Rust 真源 `examples/story/pages/mod.rs`：`PageInfo { name, icon, blurb, builder: fn() }` + `PAGES`（113 页）+ `GROUPS`（9 组）；`build_page_body` 用 `emit_keyed_scope(idx as u64)` 隔离各页 remember 槽；`main.rs` 用 `STORY_PAGE=<序号|页名>` 直达。
+- C++ 新增 `cpp/examples/story/`：`include/story/pages.h`（PageInfo/IconName/constexpr page()/PAGES/GROUPS + 99 个 builder 声明）、`src/pages.cpp`（113 项注册表逐项对齐 Rust 的 name/icon/blurb/builder，含复用 builder）、`src/shell.cpp`（StoryApp：上一页/下一页/上一组/下一组 + 页头 + build_page_body）、`src/pages_{demos,basics,data,layout,navigation,feedback,advanced,alignment,video}.cpp`、`runner/main.cpp`、`tests/story_test.cpp`。
+- **翻页关键决策**：点击回调 `request_page()` 只登记 pending，不立即改树（否则 `dispatch_click` 的 take-put 会对已销毁节点写回 → UAF）；主循环在事件处理后 `StoryApp::rebuild()` → `Composition::set_content()` 新建 Scope/SlotTable，等价 Rust `emit_keyed_scope(idx)` 的 key 隔离。`set_content` 末尾 `Recomposer::clear()` 清掉旧 Scope* dirty。页内状态用 `remember` 创建，每页重建时自然获得全新槽位。
+- **Modifier 补齐**：`modifier.h` 原 `then()` 只接 `std::function<void(Visual&)>`，无法组合两条链；新增 `then(Modifier)` 重载（`make_move_iterator` 拼接 elements_），使 `padding().then(background())` 可用。否则 `background`/`size` 只能单独用。
+- **测试坑**：`story_test.cpp` 第 3 项先用 `find_node(nav.root(),"下一页")` 找到按钮 → `dispatch_click` → 断言 pending=1/page=0 → `rebuild()` → 断言 page=1 与正文含 "Chat"；第 4 项在 Reactive 页点 `+1` → `recompose()` → 断言 `count = 1`；第 5 项在 pointerInput 页点「点击区域」→ 断言点击次数=1。逐页渲染探针遍历全部 113 页。
+- C++ 控件层只有 9 种基础控件，未覆盖的 Rust 页统一用 `detail::placeholder(title, detail)` 明确标注（不用空壳冒充完整实现）；已落地约 28 个可交互页，覆盖 Reactive/Async/CrossFade/Buttons/Toggles/Slider/TextField/Cards/List/Table/Color/Row-Column/Modifier/SizedBox/Tabs/Stepper/Pagination/Rating/Settings/SlotTable/Snapshot/Effects/pointerInput 等。
+- CMake 新增 `compose_story` 静态库 + `story_tests` + `compose_story_runner`；Skia 第三方库保活/RPATH 逻辑抽成 `foreach(skia_exe compose_skia_demo compose_story_runner)` 共用。`ctest` 2/2 通过；`compose_story_runner` 在 `DISPLAY=:0` 下 `timeout 4` 返回 124（正常存活无崩溃）。
+- 文档：`cpp/README.md` 新增 Story 章节与运行命令，根 `README.md` 的 cpp 条目同步。
+
+## 2026-11-24 续：C++ 控件层扩容（DrawOp + 18 个控件）
+- 用户要求「继续实现各种控件」。先读 `cpp/skia_app/src/compose_painter.cpp`：原 `paint_node` 按 `WidgetData::Kind` 硬编码 switch（Text/Button/Card/Checkbox/Switch/Slider/TextField），新增一种控件就要同时改 Kind 枚举与 switch。Rust 侧真源是 `DrawCmd`（定义在 `crates/compose/src/layout.rs:1833`，18 个变体，弧线靠采样路径），故 C++ 对齐为平台无关 `DrawOp`。
+- 新增 `cpp/compose/include/compose/draw.h`：`DrawOp { Rect, RoundRect, Circle, Line, Arc, Text }` + 工厂函数；`fill_width`/`fill_height`/`width_ratio` 解决「Divider 撑满父宽」「进度条按比例宽」。核心不依赖 Skia。
+- `WidgetData`/`WidgetConfig` 增加 `preferred_width/height` 与 `ops`；`measure_leaf` 优先用显式尺寸（否则回退文本测量）；新增 `Kind::Custom`。`ComposePainter::draw_ops()` 解释执行原语（相对节点矩形坐标 + 可选字号）。
+- **Skia 坑**：本机 vcpkg Skia 的 `SkPath` 已移除 `moveTo/lineTo`（迁到 `SkPathBuilder`）；直接用折线 `drawLine` 采样画弧，避免路径 API 版本差异。`PieChart` 是粗描边环扇（非实心扇形），已在 README 记录。
+- 新增 `compose_material/widgets_extra.{h,cpp}` 共 18 个控件：Divider/Badge/Avatar/Kbd/Bubble/Skeleton/Chip/Radio/Link/Tab/RatingBar/LinearProgress/CircularProgress/Spinner/BarChart/LineChart/PieChart/EmptyState；`material.h` 统一入口包含它们，`CMakeLists` 把 `widgets_extra.cpp` 加进 `compose_material`。
+- Story 对应页由 `placeholder` 换成真实控件：Icon/AvatarGroup/Kbd/Link/ContextMenu/MenuBar/Toggles(+Radio)/Value Input(+LinearProgress+Spinner)/Chips/Bubble/Chart/Tabs/Breadcrumb/Toolbar/Rating/EmptyState/ProgressCircle/Skeleton。Spinner 页（与 Value Input 共用 builder）用 `LaunchedEffect + Delay{60}` 推进相位。
+- 测试：`story_test.cpp` 新增 Chip 点击两次（选择/取消）、RatingBar `dispatch_click_at` 按位置评分、Chart/Spinner 的 ops 非空断言。`ctest` 2/2 通过；`compose_story_runner` 在页 11/30/39/75/85/87/71 各跑 2 秒均返回 124（存活无崩溃）。
+- 文档：`cpp/README.md` 已实现表补 DrawOp/扩展控件行，更新 Story 页面清单与对齐边界。
+
+## 2026-11-24 续：CMakePresets.json + vcpkg.json 集成
+- 用户要求「集成 CMakePresets.json vcpkg.json」。发现 `cpp/` 下已有两文件，但内容是从 cui 抄来的（`name=cui`、`CUI_LIBRARY_TYPE`/`CUI_SANITIZE`/`CUI_BUILD_TESTS` 等变量在本工程完全无效，还带 iOS/wasm overlay ports），属于未适配的历史残留，直接重写。
+- `cpp/vcpkg.json` 改为 `name=compose-cpp`，依赖按平台收敛：Linux 才装 `skia` / `libxcb` / `fontconfig`。Skia 默认 feature 在 Linux 已含 fontconfig/freetype/harfbuzz/icu/jpeg/png/webp，不再像 cui 那样额外加 vulkan/graphite（本机 port 元数据确认过）。
+- `cpp/CMakePresets.json` version 6：`base`(Ninja, binaryDir=`build-${presetName}`) → `vcpkg-linux/windows/macos` 隐藏基类（注入 `CMAKE_TOOLCHAIN_FILE=$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake`、`VCPKG_TARGET_TRIPLET`、`VCPKG_INSTALLED_DIR=$env{VCPKG_ROOT}/installed`、`VCPKG_MANIFEST_INSTALL=OFF`）→ 各平台 debug/release；另有 `x64-linux-asan`（真加 `-fsanitize=address,undefined`，替换原来无效的 `CUI_SANITIZE`）与 `x64-linux-manifest`（`VCPKG_MANIFEST_INSTALL=ON`，安装到 build 目录）。build/test preset 一一对应。
+- `cpp/CMakeLists.txt` 去掉硬编码 `$VCPKG_ROOT/installed/x64-linux-dynamic`：计算 `COMPOSE_VCPKG_LIB_DIR`（优先 `VCPKG_INSTALLED_DIR/${VCPKG_TARGET_TRIPLET}/lib`，再 `$VCPKG_ROOT/installed/...`），用于 Skia 第三方库 `find_library` 与 BUILD_RPATH；未用 toolchain 时才把其父目录加进 `CMAKE_PREFIX_PATH`。无 preset 老命令仍可用。
+- **关键取舍**：默认 preset 用 `VCPKG_MANIFEST_INSTALL=OFF` 复用本机已装 Skia（避免 manifest install 重新下载/现编几十分钟）；`x64-linux-manifest` 留给全新机器。
+- 验证：`cmake --list-presets` 识别 4 个 Linux configure preset；`cmake --preset x64-linux-release` 成功且 `compose_skia_demo / compose_story_runner: enabled`；`cmake --build --preset x64-linux-release -j4` + `ctest --preset` 2/2 通过；`build-x64-linux-release/compose_story_runner` 跑 3 秒返回 124（存活无崩溃，RPATH 正确）；老 `cmake -S cpp -B cpp/build` 仍能配置。
+- 文档：`cpp/README.md` 构建章节改为 preset 优先 + manifest 说明 + 无 preset 回退，Skia/Story 运行命令同步到 `build-x64-linux-release`。
+
+## 2026-11-24 续：skia_app 归入 compose
+- 用户指出「skia_app 应当集成到 compose 的吧」。此前 Skia 适配层是 `cpp/skia_app/` 顶层目录（与 compose / compose-material 平级），但命名空间已是 `compose::skia_app`，目录与归属不一致。
+- 物理迁移：`cpp/skia_app/include/skia_app/*.h` → `cpp/compose/include/compose/render`；`cpp/skia_app/src/*.cpp` → `cpp/compose/src/render`；`cpp/skia_app/demo/main.cpp` → `cpp/examples/skia_demo/main.cpp`；删掉空的 `cpp/skia_app/`。
+- include 统一为 `<compose/skia_app/...>`（源码里用 `"compose/skia_app/..."`）：3 个适配层实现 + skia_demo + story/runner 共 5 处。命名空间保持 `compose::skia_app`。
+- **仍保留独立 target `compose_skia`**（不放进 `compose_runtime`）：这样无头核心不依赖 Skia/XCB/fontconfig，找不到依赖时自动退化为纯核心构建。CMake 中源码路径改为 `compose/src/skia_app/`，PUBLIC include 改为 `compose/include`（runtime 也已 PUBLIC 暴露，此处显式写出），demo target 指向 `examples/skia_demo/main.cpp`。
+- 验证：`cmake --preset x64-linux-release` 重配 + 增量构建 8 个目标成功；`ctest --preset` 2/2 通过；`compose_skia_demo` 与 `compose_story_runner` 各跑 2 秒均返回 124（存活无崩溃）。`cpp/README.md` 对齐表与路径已同步。
+
+## 2026-11-24 续：platform 层 + 取消独立 compose_skia
+- 用户要求「实现各个平台 /work/study/cui/cui_core/include/cui/platform」。调研确认 cui 的真实结构是 `PlatformEvent → PlatformWindow → Application/AppWindow + services/*`，没有 `platform.h`；工厂是编译期宏选择后端，服务通道是运行时注入。
+- C++ 新增 `cpp/compose/include/compose/platform/`：`event.h`（PlatformEvent/EventType/KeyCode/滚轮 56px 单位）、`platform_window.h`（纯虚核心 + IME/剪贴板/自呈现默认虚接口 + NativeHandles void* 聚合）、`platform_factory.h`（`createPlatformWindow()` 按宏选后端，Wayland 默认不接入）、`platform_info.h`，以及 `services/{method_channel,event_channel,app_lifecycle,file_dialog}.h`。
+- 实现 `cpp/compose/src/platform/`：`x11_window.cpp`（完整 XCB：事件翻译/键盘映射用 `xcb_get_keyboard_mapping` 免额外依赖/剪贴板进程内/presentPixels=xcb_put_image/合成 invalidate+wake 事件）；`win32_window.cpp`（WndProc/GDI StretchDIBits/系统剪贴板/DPI）；`cocoa_window.mm`（NSWindow+NSView/CALayer）；`android_window.cpp`（ANativeWindow_lock 整帧上屏 + AInputEvent）；`ios_window.mm`、`ohos_window.cpp`、`web_window.cpp`（宿主驱动队列 + 各自 presentPixels 契约）、`wayland_window.cpp`（接口骨架）。services 实现 4 个 cpp，Linux 文件对话框走 zenity→kdialog，其余可注入 backend。
+- **用户中途纠正「无需独立 compose_skia，只作为 compose 库一部分」**：撤销此前保留独立库的决定。CMake 重排：`compose_runtime` 现在包含 core + services + 当前平台后端 + `skia_app/{skia_surface,compose_painter}.cpp`，`compose_material` 仍独立（PRIVATE include 供 painter 使用），彻底删除 `compose_skia` target 与可执行同名混淆——GUI demo 改名为 `compose_demo`。找不到 Skia/fontconfig/平台后端时 `COMPOSE_GUI_AVAILABLE=FALSE`，只构建库与测试。
+- 删除旧 `compose/include/compose/skia_app/x11_window.h` 与 `compose/src/skia_app/x11_window.cpp`；两个示例改用 `createPlatformWindow()` + `PlatformEvent` + `window->presentPixels(...)`，不再直接 include XCB。
+- 新增 `tests/platform_test.cpp`（工厂非空、事件默认、Method/EventChannel 回环、生命周期观察者、文件对话框注入），ctest 从 2 项变 3 项。
+- **坑**：web_window.cpp 的 JS 桥接 extern "C" 不能访问匿名namespace 单例，改为命名空间的 `web_singleton()`；sed 批量替换曾把函数名误改成 `web_web_singleton`，已修正。`file_dialog.cpp` 用 `unique_ptr<FILE, decltype(&pclose)>` 触发 `-Wignored-attributes`，改成自定义 `PipeCloser` deleter。
+- 验证：`cmake --preset x64-linux-release` 显示 `GUI targets: enabled (platform=linux, Skia/XCB/fontconfig)`；39 个构建目标全过；`ctest --preset` 3/3 通过；`compose_demo` 与 `compose_story_runner` 各跑 2 秒返回 124（存活无崩溃）。
+- 文档：`cpp/README.md` 新增平台层/库结构章节，根 `README.md` 与 `vcpkg.json` 描述同步。
+
+## 2026-11-25 续：cpp 液态玻璃观感修正（壁纸配色 / 同心环 / 裁切）
+- 用户反馈「液态玻璃背景不好看」。**根因不在玻璃渲染**（`ComposePainter::paint_glass` 用 `SkImageFilters::Blur` 做真 backdrop blur 是对的），而在它背后那层：cpp `ColorScheme::light()` 的 secondary=0x625B71 / tertiary=0x7D5260 是 M3 低饱和灰调，被 Rust 版壁纸直接拿来铺底 ⇒ 模糊出来是一团灰紫雾，看不出任何色彩层次。
+- 改法（`cpp/examples/story/src/shell.cpp::glass_wallpaper` + Rust 同源）：①固定高饱和桌面色板（紫罗兰 0x5B4BFF / 品红 0xFF4FA3 / 天青 0x18C2FF / 薄荷 0x2BE3A6），各自与 `cs.primary` 混 0.22 ⇒ 换 Ocean/Forest/Rose 色板时壁纸仍跟着变调；②每枚光斑由单个大实心圆改 `kGlassBlobRINGS = 12` 层**同心环**近似径向衰减（第 i 层增量 `a = (want − acc)/(1 − acc)`，`want = peak·(1 − smoothstep(f))` ⇒ 中心累计 α 恰等于峰值、边缘平滑归零），消掉 dock 缝隙里露出的硬边圆弧；③暗色主题 `gain 1.35` + 混白 0.28 提亮（玻璃 tint 本身 40% 深灰，壁纸再暗就糊成墨）；④`glass_spec()` tint 减淡一档（暗 0.50→0.40、浅 0.40→0.34），毛玻璃要「看得到背景」才像玻璃。
+- **DrawOp 无渐变无裁切**：本机 vcpkg skia 快照不导出 `SkGradientShader`（cpp/README 已记录），Rust `DrawCmd` 也只有线性渐变 ⇒ 同心环是与两侧能力等价的唯一柔和衰减手段。裁切则必须绕：cpp `draw_ops` 完全不裁，而光斑半径 `max(w,h)·0.45` 远大于节点矩形，沿窗口四周 8px 留白画出一圈「彩色画框」；`paint_node` 的 `scrollable` 只 clip **孩子**（在自身 ops 之后），故 cpp 用「`Kind::Box + scrollable=true` 裁切壳包 Custom 绘制片」两层。Rust 有真通道 `Modifier::clip()` → `DrawCmd::ClipPush` → valo `clip_rrect`，直接在 Canvas 上加 `.clip(0.0)` 即可。
+- 壁纸节点数仍恒定（关态 draw_fn 返回空 ops），不破坏 cpp 单 root scope 的「节点数恒定才能 bump 增量重组」不变式。
+- 验证回路：`build-x64-linux-debug/zz_glass.cpp` 离屏出 4 张 PNG（明/暗 × 开/关）真目视。**坑**：cpp `SetLiquidGlass` 只改裸 bool、不置脏任何作用域（Rust 走 MutableState），构造 StoryApp 后单独 `recompose()` 是空转，必须 `app.do_menu_action(2, 5|6)` 经 `bump()` 才会重跑 `emit_shell` 重读材质。
+- 测试：cpp `story_test.cpp` 9e (E) 块升级为「下降到裁切 Box + 4×11 环 + 半径单调递减 + src-over 累计 α 收敛到峰值 + 最外环半径 = 540·尺寸比·(1−1/12) + 圆心分数位」；Rust 新增 `crates/compose-material/tests/glass_wallpaper.rs`（3 项：柔和同心环+裁切、暗色提亮、tint 保持半透明）+ `SetLiquidGlass` 复位。**断言教训**：单盘增量并非越靠外越小（分母 `1 − acc` 在收缩，越靠内反而越大），可单调的是「累计不透明度」，拿单层增量做衰减断言会假失败。
+- 验证：`ctest --preset x64-linux-debug` 3/3 全绿（compose_tests / platform_tests / story_tests）；`cargo test -p compose -p compose-material --tests` rc=0 全绿；`cargo check --workspace --tests` 仅历史告警。GUI 最终观感待用户在 CLion 目视验收。
+
+## 2026-11-25 续：cpp 键盘焦点路由（List 页选中后方向键误切侧栏）
+- 用户报 bug：「List 页面，选中 List item，然后上下箭头，无法在 list item 间切换，却是在 sidebar 上切换」。三层根因：① **cpp 引擎根本没有键盘通道**（`LayoutNode` 无 onKey、无焦点跟踪、无 `dispatch_key`）；② material 的 `ListItems` / story 的 `page_list()` 是无焦点容器（Rust 侧 `List/ListView/GridView/TreeView/Sidebar` 全走 `focusable_full`）；③ story 用 app 级裸 bool `sidebar_focus_` 门控 `handle_key`，只有点侧栏条目才置真 ⇒ 点页面内容后方向键永远在切侧栏。
+- 引擎层（`compose/{applier.h,applier.cpp}`）：`LayoutNode` 加 `onKey` + `focusToken`，并继承 `EnableSharedFromThis`（焦点表要持弱引用）。焦点身份 = **uint64 token** 而非节点指针：thread_local `vector<FocusEntry{token, WeakPtr<LayoutNode>}>`，`register_focusable` 登记时顺带 `erase_if(expired)` 剪枝；聚焦 token 存**响应式** `MutableState<uint64_t>`（`focused_token()` 用 `get()` 注册读者 ⇒ 聚焦环自动定向重组，宿主不再需要 bool + rebuild_shell）。8 个 API：`next_focus_token/register_focusable/focused_token/is_focused/set_focus/focus_node/clear_focus/dispatch_key`。`dispatch_click` 改为 Rust 的**两条独立链各走到底**（先整链找最近 onKey 祖先定焦点，再整链找 onClick 消费），且**先定焦点再执行处理器**；点不到任何 onKey 容器时 `clear_focus()`（与 Rust 一致，故点普通内容后方向键确实不响应）。
+- material 层：`WidgetConfig` 末尾追加 `onKey/focusToken`（位置式聚合初始化，新字段只能进尾部）；`create_widget` 接线；新增三个 helper `attach_key_nav(node,on_key,token)` / `nav_index(key,cur,len)` / `list_nav_on_key(sel,len,key)`，逐项对齐 Rust `mod.rs:140`（len==0→0；Up −1 saturating / Down +1 clamp / PageUp·Down ±8 / Home 0 / End last；`list_nav_on_key` 用 `read_unregistered` 取活值再 `set`，连按不丢步）。接入点：`ListItems`、`TreeView`、`GridView`（二维）、`Sidebar`（`SidebarSpec` 加 `on_key + focus_token`）。**未接** `LazyColumn`（Rust 侧同样不走 focusable_full）。
+- story 层：删 `sidebar_focus_` bool，改 `std::uint64_t sidebar_token_ = compose::next_focus_token()`（声明必须早于 `dock_/composition_`），`sidebar_focus()` 由 `compose::is_focused(sidebar_token_)` 派生；侧栏是应用骨架，token 由宿主长期持有并每次组合传回 ⇒ **跨 `set_content` 整树换代保焦点**（对齐 Rust「焦点记 owner_scope 而非 NodeId」）；页内列表 token 由节点自分配 ⇒ 换页即失焦（符合预期）。`set_sidebar_focus` 走引擎且**不再 rebuild_shell**；runner 的 KeyDown 兜底由 `app.handle_key(key)` 改 `compose::dispatch_key(key)`。
+- **关键陷阱（勿改回去）**：`create_widget` 在 `config.onKey` 为空时**绝不能清 `node->focusToken`**。「先发射容器、后 `attach_key_nav`」是本工程固定顺序，清身份 ⇒ 每轮组合换一次 token ⇒ 一次重组即失焦。`attach_key_nav` 传空 on_key 同理只解绑、保留身份。
+- 验证：`ninja` 39/39 绿；`ctest --preset x64-linux-debug` 3/3 全绿。新增 story 测试 **12b** 三段钉住本次 bug：(a) List 页点行 → `!sidebar_focus()` + `dispatch_key(Down)` 返回真 + 行高亮从「项目文档」移到「稍后处理」且 `page()==31` 不变（高亮判据 = ListItem ops 里 `secondary_container` 填充 RoundRect）；(b) ListView 页用可见文本「选中 = N」逐项验 nav_index 语义（End/Home/PageUp·Down ±8/越界夹取）；(c) 点侧栏条目 → 焦点在侧栏 → `rebuild()` 换代后 `dispatch_key(Down)` 仍切页（token 保焦点）。既有测试 12（`set_sidebar_focus(true)` + `handle_key`）未改仍绿，证明新写法向后兼容。GUI 手感待用户在 CLion 目视验收。
+
+## 2026-11-25 续：cpp SearchableList 内容越界（卡片须裁切 + 可滚）
+- 用户报 bug：「SearchableList 内容越界了，应在 card 内，card 应可滚动」+ 截图（Spam/Trash/Starred 画到描边框外）。根因：`pages_data.cpp::page_searchable_list()` 用**普通 `Column` + `height(240)`** 装 8×56=448px 行内容 —— painter 只对 `layout.scrollable` 的节点 `save/clipRect/restore`（`render/painter.cpp:349`），普通 Column 的定高只收口容器**自身**输出尺寸（`apply_fixed_size`），孩子照画 ⇒ 越界，且滚轮找不到可滚祖先。Rust 同源是 `VerticalScroll(fill_max_width().height(220).border(1, outline_variant, 12))`，本来就该是滚动容器。
+- 改法（`pages_data.cpp`）：外层 `Column` → **`ScrollColumn`**；发射行数由 `kRows=8` 提到 **`kAll.size()=12`**（否则过滤前 12 项只有 8 项可见、滚到底也看不到后 4 项）；每行外套 **`SizedClip(size_fn, ...)`** 把不匹配行的**自身高度收成 0** ⇒ 内容全长 = 命中行数 × 56，既不留空白行也不产生空白滚动区；视口高取组合期可算的 `min(240, 命中行数 × 56)`（命中 ≤4 行时框刚好包住内容不出条，命中多时 240 视口 + 真溢出，0 命中时自然高 0 —— 描边随 `r.isEmpty()` 一并免绘，见 painter 的「零面积⇒无盒子装饰」）。
+- **两处 C++ 侧硬约束（决定上面这套写法，勿试图绕过）**：① `Modifier::height(0.0f)` 是**空操作** —— `apply_fixed_size` 用 `if (data->visual.height > 0.0f)` 守卫，只有 `size_fn`（判据 `>= 0.0f`，负值才是「沿用自然值」）能表达 0 高；② 单 root Scope 扁平槽位流 ⇒ 发射数量必须恒定，所以不能像 Rust 那样只发射 `hits`。CommandPalette 的「`preferred_height = live ? rowH : 0`」惯用法在本管线**并不真的归零**：`measure_leaf` 在 `preferred_height<=0` 时回落到 `measure_text("")` 的高（painter 测量器恒返 `size*1.55≈26`），故过滤列表要用 `SizedClip`+`size_fn`。
+- 顺带修两处引擎/宿主缺口（本次写法的必要前提）：
+  - `compose/src/layout.cpp measure_node`：scrollable 节点测完后把 `scroll_offset` 按**新布局**夹到 `[0, content-viewport]`（主轴跟 `scroll_horizontal`）。`create_widget` 故意跨重组保留偏移，过滤/折叠使内容变短后陈旧偏移会把可见项推出视口 = 空白卡片。
+  - `examples/story/runner/main.cpp` 的 MouseWheel：由「取最近可滚祖先滚一次」改为**沿父链逐个试、第一个真能量得动的生效**。纯裁切壳（`SizedClip`）也带 `scrollable` 但无溢出，只看最近一个会让滚轮在外层列表里石沉大海（嵌套滚动普遍受影响）。
+- 测试：story 块 34 新增 **34.e/34.f**（行壳 `scrollable && !scrollbar`、卡片 `scrollable && scrollbar`、视口 240 且内容全长 672、末行绝对矩形落在卡片底边之下（= 被裁切而非画框外）、`scroll_by` 夹到 `content-viewport`、过滤到 1 项后内容全长塌成 56 且陈旧偏移被夹回 0、无溢出不画条、`count_nodes` 恒定）。`ninja` 绿 + `ctest --preset x64-linux-debug` 3/3 全绿（compose_tests / platform_tests / story_tests）。GUI 观感待用户在 CLion 目视验收。
+- 同类未改（非本次报障点，待确认后再动）：`pages_demos.cpp::page_search_bar` 同样固定 6 行但**无定高** ⇒ 不越界，只是过滤后仍占空白高度；`ListItem` 的选中底按组合期文本宽（`o.width` 未设）而非卡片宽，故高亮比框窄。
+
+## 2026-11-26 续：video 底部叠放播放控件（自动隐藏 + 自定义控件），Rust / cpp 双端对齐
+- 需求：「video 底部可内置播放控件（自动隐藏），也可设自定义的；请对齐 rust 版本」，规格真源 = `/work/study/cui/rust/examples`（`rui_extra/src/video.rs::VideoPlayerWidget` + `examples/src/pages/media.rs::page_video()`：底部 Positioned + auto_hide 2s + MouseRegion + AnimatedOpacity + IgnorePointer + `controls_builder`）。范围经用户确认 = Rust + cpp 双端都补。
+- Rust（`crates/compose-material/src/widgets/video.rs`）：新增 `type VideoControlsBuilder = Rc<dyn Fn(bool)>`、`VideoControlsOverlay(controller, modifier)`（半透深底内置条）、`VideoPlayerWidget(controller, modifier, auto_hide, Option<VideoControlsBuilder>)`。`collapsed = remember(mutableStateOf(false))`，`show = !ready || !auto_hide || !collapsed`；`hoverable` 包舞台（进入 ⇒ seq+1 + collapsed=false；移出且 auto_hide ⇒ collapsed=true），底层 `Clickable(Video)`（点画面 toggle_play + 重新显形），上层 `Box(fill_max_size().alpha(animate_float_as_state(show?1.0,0.0, Tween(STAGE_FADE_SECS))) (+show?():.no_hit()), BottomStart)` 放 builder 或内置条；收起靠 `feedback::auto_hide_after(seq, STAGE_HIDE_DELAY_SECS=2.0, armed=show, …)`（**armed=show** ⇒ 只要处于显形态就挂着倒计时，不需先有鼠标事件）；`controller.session_id()` 变化 ⇒ collapsed 复位。常量 `STAGE_HIDE_DELAY_SECS=2.0 / STAGE_FADE_SECS=0.2`。story 页（`examples/story/pages/video.rs`）：舞台 `fill_max_width().height(280).background(黑,8)` + 「使用自定义控件 / 切回内置控件」开关（自定义 builder = 单条蓝底画布、13px 文本），页底独立的 播放/暂停·关闭 按钮与 Slider 删除。回归 `crates/compose-material/tests/video_player_overlay.rs` 5 项。
+- cpp 库层：新建 `compose-material/include/compose_material/widgets_video.h` + `src/widgets_video.cpp`（已加入 `cpp/CMakeLists.txt` 的 compose_material 源列表）：`VideoControls(VideoStatePtr, Modifier={}, bool overlay=false)` / `VideoPlayer(VideoStatePtr, Modifier={}, bool auto_hide=true, std::function<void(bool)> controls_builder={})`。`VideoState` **末尾**追加 `atomic<float> volume` + `uint64_t session` 与 5 个动作 helper（`togglePlay/seekTo/setVolume/openSource/closeSource`，后两者顺带 `++session`）—— 控件只改这些字段 / 往 `cmds` 无锁队列发命令，解码与音频输出仍归宿主 worker；`pumpAudio` 在 `pa_simple_write` 前按 `volume` 做 16.8 定点缩放。
+- cpp 实现要点（引擎能力差异，别当 bug 查）：
+  - **节点拓扑恒定**：舞台(`video_stage`) / 画面 / 控制条容器(`video_bar`) 常驻发射，隐藏 = `layer_fn` 的 alpha 0 + 组合期 `visual.no_hit` ⇒ 点击穿透而非删节点，故可增量重组；而页面级「内置 ↔ 自定义」两条子树节点数不同 ⇒ 必须整体重建。为此新增 `story::request_shell_structural_rebuild()`（shell.h/.cpp，= `StoryApp::rebuild_shell()` = set_content），与既有 `request_shell_rebuild()`（bump，仅增量重组、不删旧节点）分工写死。
+  - 计时取 `compose::Scheduler::instance().now_ms()` 逻辑钟（宿主每圈按真实耗时 advance ⇒ 生产仍是墙钟，但无头测试能直接推进）；`compose::animation::clock_nanos()` 是 steady_clock，测试推不动。
+  - 收起倒计时挂在控制条的 `size_fn`（测量期）：到点 `collapsed.set(true)`，未到点 `request_anim_frame_after(剩余秒)` 定点唤醒；淡入淡出在 `layer_fn` 里按 easeOutCubic 求值，未播完 `request_anim_frames()`。
+  - cpp 无子树 MaterialTheme ⇒ 叠放条用显式配色（`0x8C000000` 底 + 白字）；hover 只在命中节点变化时触发 ⇒「移动即续期」退化为「进入 / 点击时重新计时」。
+  - `stage_cfg.box_align = BottomStart`：画面 `fill_max_size()` 铺满、控制条按**自然高**贴底边 —— 若让控制条容器也铺满舞台，它会吞掉画面上半部的点击。
+- 测试：story 块 42 断言随页面改造更新（不再找「播放 / 暂停」「关闭」，改找 `video_stage`/`video_bar` + 内置条的「播放/暂停」「音量+」）；新增**块 57** 八段（叠放几何 280 + 贴底 + 画面铺满、未就绪常显、就绪后 2 秒自动收起且 `count_nodes` 恒定、`ComposePainter::hit_test` 真实命中链路验穿透、点画面重新显形、hover 移出即收起 / 移入即显形、自定义 builder 整体替换且自带交互、切页撤离）。
+- **两个测试陷阱（本窗口踩到）**：① `rebuild_shell()` = set_content 会让 `create_widget` 里 `remember<NodePtr>` 的槽表换代 ⇒ **旧 NodePtr 指向已废弃的树**，读它的 `visual` 只会得到陈旧值（表现为「逻辑明明生效、断言却失败」），任何跨结构重建的断言都必须重新 `find_node` 定位；② `semantics::Tree::hit_test` 的 `no_hit` **不继承祖先**（`semantics.cpp:296` 只取本节点），要验「no_hit 波及整棵子树」必须走 `ComposePainter::hit_test`（`painter.cpp:87` 有 `blocked` 累加）。
+- 验证：`cargo test -p compose -p compose-material --tests` 全绿；`cargo check -p examples --examples` 通过；`cmake --build --preset x64-linux-debug` 绿；`ctest --preset x64-linux-debug` 3/3 全绿。GUI 观感（悬停显隐、淡入淡出、点画面切播放、音量）待用户在 CLion 目视验收。
+
+## 2026-11-26 续：鼠标指针卡在「青色十字」（X11 glyph cursor 形参错位）
+- 用户报障：指针突然变成**青色十字**且**不自愈**。该形状不属于引擎 `Cursor` 枚举（Default/Grabbing/Move/ResizeEW/NS/NWSE/NESW），故排除业务层设错形状，直取 X11 后端。
+- 根因（`compose/src/platform/x11_window.cpp::glyph_cursor`，随 `docking` 提交 f1b7d7c 引入）：`xcb_create_glyph_cursor` 的形参顺序是 `(cid, source_font, mask_font, source_char, mask_char, fore_rgb, back_rgb)`，而调用把字形号 `g / g+1` 写在了**最后两个槽**（back_green / back_blue），前两个 char 槽填了 `0, 0`。cursor 字体的 **0 号字形 = `XC_X_cursor`**（X server 内置十字/X 光标），同时前景色被挤成 `(0, 0xffff, 0xffff)` = **青色** ⇒ 任何 `Cursor` 取值都渲染成同一个青色十字，与形状枚举完全无关，所以「怎么动都不变、一直卡着」。修复 = 字形号归位到 `source_char/mask_char`，颜色保持前黑 `(0,0,0)` / 后白 `(0xffff,0xffff,0xffff)`（对齐 Xlib `XmuCreateCursorFromName`）。
+- 触发时机与 video 页改动**无因果**：全仓 `set_cursor` 写入点只在 `compose-material/src/docking_view.cpp`（分栏条 hover 复位 L548/556/686、标签拖拽 Grabbing/Default L580/588/606、浮窗标题 Move L1820、浮窗边缘 `edge_cursor` L1677/1767/1719/1723/1852/1895），首次把指针划到 dock 分栏缝/标签/浮窗边才第一次真正 `xcb_change_window_attributes(XCB_CW_CURSOR)`（`applied_cursor_=0xFF` 使首调必发），此前窗口一直沿用 WM 主题光标，故观感上是「突然」变。`Cursor::Default` 走 `XC_left_ptr`（68），修好后即经典箭头；若想要主题箭头可让 Default 下发 `XCB_NONE` 继承父窗（未改，避免动行为）。
+- 验证：`cmake --build --preset x64-linux-debug` 绿（x11_window.cpp 重编）、`ctest --preset x64-linux-debug` 3/3 全绿。光标视觉效果无法无头断言，待用户在 CLion 目视确认（划过分栏条应变左右双箭头、离开应恢复箭头）。
+
+
+
+
+
+
+

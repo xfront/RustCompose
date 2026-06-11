@@ -705,6 +705,17 @@ pub fn request_anim_frames() {
     FRAME_REQUEST.with(|f| f.set(true));
 }
 
+/// 非破坏读取续帧请求（不消耗）。多窗口宿主逐窗口绘制时用它：
+/// 若每个窗口都用 [`animations_active`]，先绘的窗口会把请求吞掉，后绘的窗口误判为静止。
+pub fn animations_requested() -> bool {
+    FRAME_REQUEST.with(|f| f.get())
+}
+
+/// 清除续帧请求（多窗口宿主在本轮所有窗口绘制完成后调用一次）。
+pub fn clear_anim_frames_request() {
+    FRAME_REQUEST.with(|f| f.set(false));
+}
+
 /// 请求宿主在 `delay_secs` 秒后再推进一帧（相对当前时刻）。
 ///
 /// 与 [`request_anim_frames`] 的区别：后者要**连续**帧（补间/无限动画），前者只要
@@ -733,6 +744,23 @@ pub fn take_wake_delay() -> Option<f32> {
 /// 当前注册表中的动画数量（测试 / 诊断：验证「静止即退集」与无泄漏）。
 pub fn running_animations() -> usize {
     RUNNING.with(|r| r.borrow().len())
+}
+
+/// 有动画在跑的组合根集合（多窗口续帧调度用：只给「有动画的窗口」请求下一帧）。
+///
+/// 先快照作用域再逐个解析归属根（`scope_root` 需借 runtime，不能在 `RUNNING` 的
+/// `borrow` 内调用：两者都是线程局部 `RefCell`，但作用域解析会重入 runtime）。
+pub fn running_animation_roots() -> Vec<crate::layout::NodeId> {
+    let scopes: Vec<ScopeId> = RUNNING.with(|r| r.borrow().values().map(|e| e.scope).collect());
+    let mut roots: Vec<crate::layout::NodeId> = Vec::new();
+    for s in scopes {
+        if let Some(root) = crate::runtime::scope_root(s) {
+            if !roots.contains(&root) {
+                roots.push(root);
+            }
+        }
+    }
+    roots
 }
 
 fn alloc_id() -> u64 {

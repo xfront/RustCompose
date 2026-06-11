@@ -25,14 +25,33 @@ type Factory = fn() -> Box<dyn App + 'static>;
 
 static FACTORY: std::sync::OnceLock<Factory> = std::sync::OnceLock::new();
 
-/// 注册应用工厂（备用模式：宿主 android_main 调此 + [`run_app_with_android`]）。
+/// 注册应用工厂（备用模式：宿主直接调此 + [`run_app_with_android`]）。
 pub fn register_app_factory(f: Factory) -> bool {
     FACTORY.set(f).is_ok()
 }
 
-/// 应用入口（examples 的 `#[no_mangle] android_main` 调用）：工厂取 App 并启动事件循环。
+/// 应用根注入点（链接期符号）：引擎宿主只声明，应用层实现并链进最终产物。
+///
+/// 对齐 cui 的 `cui_core::createAppRoot()`：平台入口只依赖这个声明，不知道跑的是
+/// 哪个应用；只链引擎而不链应用实现会在链接期因未解析符号报错。用 `extern "Rust"`
+/// ABI 传递 `Box<dyn App>`，这是 FFI 边界唯一必要的 unsafe。
+unsafe extern "Rust" {
+    fn compose_create_app_root() -> Box<dyn App + 'static>;
+}
+
+/// 应用入口：工厂取 App 并启动事件循环。
 pub fn android_entry(factory: Factory, app: AndroidApp) {
     run_app_with_android(factory(), app);
+}
+
+/// Android NativeActivity 入口（由 cdylib 导出，NativeActivity 按 dlsym 查找）。
+///
+/// 引擎层持有入口与完整事件循环（对齐 cui `cui_core/src/platform/android/cpp/main.cpp`）；
+/// 应用层只需实现 [`compose_create_app_root`] 注入具体 Widget 树。
+#[unsafe(no_mangle)]
+pub extern "C" fn android_main(app: AndroidApp) {
+    let factory: Factory = || unsafe { compose_create_app_root() };
+    android_entry(factory, app);
 }
 
 /// 启动 Android `android-activity` 事件循环，驱动 `Kernel` 渲染。

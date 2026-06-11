@@ -19,13 +19,22 @@
 extern crate self as compose;
 
 pub mod animation;
+pub mod async_rt;
+pub mod cursor;
 pub mod foundation;
 pub mod input_router;
 pub mod layout;
 pub mod material;
+pub mod applier;
+pub mod gesture;
+pub mod modifier_node;
 pub mod platform;
 pub mod render;
 pub mod runtime;
+pub mod semantics;
+pub mod slot_table;
+pub mod snapshot;
+pub mod subcompose;
 
 // ── 根级便利重导出（原 compose-platform 的对外门面；业务侧 `use compose::{App, run_app, …}`）──
 pub use render::{
@@ -38,7 +47,10 @@ pub use render::{
     not(target_env = "ohos"),
     not(target_os = "ios")
 ))]
-pub use render::{WindowConfig, run_app, run_app_with};
+pub use render::{
+    close_window, current_window, open_window, run_app, run_app_with, window_count, WindowConfig,
+    WindowHandle,
+};
 #[cfg(target_os = "android")]
 pub use platform::android::{AndroidApp, android_entry, run_app_with_android};
 
@@ -67,8 +79,9 @@ pub mod prelude {
     };
     pub use crate::runtime::NavKey;
     pub use crate::runtime::{
-        Composer, Composition, CompositionLocal, MutableState, Recomposer, TaskId, advance_frame,
-        clear_focus, derivedStateOf, disposable_effect, focused_scope, keyed_remember,
-        launched_effect, mutableStateOf, remember, set_focus, side_effect, spawn_task,
+        Composer, Composition, CompositionLocal, MutableState, Recomposer, SideEffect, TaskId,
+        advance_frame, clear_focus, derivedStateOf, disposable_effect, focused_scope,
+        keyed_remember, launched_effect, mutableStateOf, producedState, remember,
+        rememberUpdatedState, set_focus, side_effect, snapshotFlow, spawn_task,
     };
 }

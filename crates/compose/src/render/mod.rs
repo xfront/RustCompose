@@ -15,6 +15,7 @@
 //! 等平台能力）见 [`crate::platform`]，只负责「取原生窗口 + 事件泵」，复用本后端。
 
 mod display_list;
+pub mod image_cache;
 mod gpu;
 pub mod kernel;
 pub mod host;
@@ -34,4 +35,7 @@ pub use kernel::{App, Kernel, ValoTextMeasurer, init_text_context};
     not(target_env = "ohos"),
     not(target_os = "ios")
 ))]
-pub use host::{WindowConfig, run_app, run_app_with};
+pub use host::{
+    close_window, current_window, open_window, run_app, run_app_with, window_count, WindowConfig,
+    WindowHandle,
+};

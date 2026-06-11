@@ -1,10 +1,10 @@
 #!/bin/bash
-# build_apk.sh — 把 `gallery` 示例打包为可安装、可运行的 Android APK。
+# build_apk.sh — 把 `story` 示例打包为可安装、可运行的 Android APK。
 #
 # 走 NativeActivity 集成路线（android-activity 直驱模型）：
-#   - cargo 交叉编译示例 → 重命名为 libgallery.so（导出 android_main）
+#   - cargo 交叉编译示例 → 重命名为 libstory.so（导出 android_main）
 #   - aapt2 link 依据 AndroidManifest.xml 生成 APK 骨架（activity = android.app.NativeActivity）
-#   - 把 libgallery.so 塞进 APK，zipalign 对齐 + apksigner 用调试证书签名
+#   - 把 libstory.so 塞进 APK，zipalign 对齐 + apksigner 用调试证书签名
 #
 # 前置条件：
 #   - $ANDROID_HOME / $ANDROID_SDK_ROOT 指向 Android SDK（含 build-tools / platforms）
@@ -22,6 +22,7 @@ SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/tools/dev-cache/android-sdk}}"
 if [ -z "${ANDROID_NDK:-}" ]; then
     ANDROID_NDK="$(ls -1d "$SDK"/ndk/*/ 2>/dev/null | sort -V | tail -1)"
 fi
+API_LEVEL="${API_LEVEL:-26}"
 ANDROID_NDK="${ANDROID_NDK%/}"
 [ -d "$ANDROID_NDK" ] || { echo "ERROR: 未找到 NDK ($SDK/ndk)"; exit 1; }
 
@@ -33,7 +34,6 @@ PLATFORM="$(ls -1d "$SDK"/platforms/android-*/ 2>/dev/null | sort -V | tail -1)"
 ANDROID_JAR="${PLATFORM}android.jar"
 [ -f "$ANDROID_JAR" ] || { echo "ERROR: 未找到 android.jar ($PLATFORM)"; exit 1; }
 
-API_LEVEL="${API_LEVEL:-26}"
 ABI="${ABI:-arm64-v8a}"
 case "$ABI" in
     arm64-v8a)    RUST_TARGET="aarch64-linux-android"; TRIPLE="aarch64-linux-android" ;;
@@ -58,10 +58,10 @@ export "CARGO_TARGET_${RUST_TARGET_UC}_LINKER=$TOOLCHAIN/${TRIPLE}${API_LEVEL}-c
 export "CARGO_TARGET_${RUST_TARGET_UC}_AR=$TOOLCHAIN/llvm-ar"
 export PATH="$TOOLCHAIN:$PATH"
 
-EXAMPLE="gallery"
-LIB_NAME="gallery"
-PKG_LABEL="Compose Gallery"
-PKG_NAME="dev.compose.gallery"
+EXAMPLE="story"
+LIB_NAME="story"
+PKG_LABEL="Compose Story"
+PKG_NAME="dev.compose.story"
 
 STAGE="$WS_ROOT/target/apk-stage-$ABI"
 OUT="$WS_ROOT/target"
@@ -72,9 +72,10 @@ echo "  SDK: $SDK | NDK: $ANDROID_NDK | ABI: $ABI / $RUST_TARGET (API $API_LEVEL
 
 echo "==> 交叉编译 $LIB_NAME (release, $RUST_TARGET)"
 cd "$WS_ROOT"
-cargo build --example "$EXAMPLE" --target "$RUST_TARGET" --release
-SO_SRC="target/$RUST_TARGET/release/examples/$EXAMPLE"
-[ -f "$SO_SRC" ] || { echo "ERROR: 未找到产物 $SO_SRC"; exit 1; }
+cargo build -p examples --lib --target "$RUST_TARGET" --release
+# story_android cdylib 才是导出 android_main 的 NativeActivity .so。
+SO_SRC="target/$RUST_TARGET/release/libstory_android.so"
+[ -f "$SO_SRC" ] || { echo "ERROR: 未找到产物 $SO_SRC（先跑 build_android.sh）"; exit 1; }
 # NativeActivity 加载 lib<lib_name>.so
 cp "$SO_SRC" "$STAGE/lib/$ABI/lib$LIB_NAME.so"
 echo "  lib$LIB_NAME.so: $(du -h "$STAGE/lib/$ABI/lib$LIB_NAME.so" | cut -f1)"
@@ -88,9 +89,11 @@ cat > "$MANIFEST" <<MANIFEST_EOF
     android:versionCode="1"
     android:versionName="1.0">
     <uses-sdk android:minSdkVersion="${API_LEVEL}" android:targetSdkVersion="34" />
+    <uses-permission android:name="android.permission.INTERNET" />
     <uses-feature android:glEsVersion="0x00030000" android:required="true" />
     <application android:label="${PKG_LABEL}"
         android:icon="@android:drawable/sym_def_app_icon"
+        android:hasCode="false"
         android:extractNativeLibs="true"
         android:debuggable="false">
         <activity android:name="android.app.NativeActivity"
@@ -111,9 +114,9 @@ echo "==> aapt2 link"
 "$AAPT2" link -o "$STAGE/base.apk" --manifest "$MANIFEST" -I "$ANDROID_JAR" \
     --min-sdk-version "$API_LEVEL" --target-sdk-version 34 --version-code 1 --version-name 1.0
 
-echo "==> 打入 lib$LIB_NAME.so"
+echo "==> 打入 lib$LIB_NAME.so（STORED 不压缩，供 zipalign 页对齐）"
 cd "$STAGE"
-zip -X -q base.apk "lib/$ABI/lib$LIB_NAME.so"
+zip -0 -X -q base.apk "lib/$ABI/lib$LIB_NAME.so"
 cd "$WS_ROOT"
 
 echo "==> zipalign"

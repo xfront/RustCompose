@@ -33,15 +33,24 @@ impl AppBarAction {
     }
 }
 
-/// `Scaffold(topBar, bottomBar) { content }` — Compose `Scaffold`。
+/// `Scaffold(topBar, bottomBar, overlay) { content }` — Compose `Scaffold`。
+///
+/// `overlay` 是 Scaffold 管理的**覆盖层**（BottomSheet / AutoHideToolbar / Snackbar
+/// 等悬浮件）：在 content 之后组合 ⇒ 叠在内容**上一层**，由 Scaffold 统一托管层级，
+/// 页面不必自己搭 Box 叠加结构。
 pub fn Scaffold(
     modifier: Modifier,
     top_bar: Option<Box<dyn Fn()>>,
     bottom_bar: Option<Box<dyn Fn()>>,
+    overlay: Option<Box<dyn Fn()>>,
     content: impl Fn() + 'static,
 ) {
     let ck = RememberOverlayKey();
     PutOverlayContent(ck, content);
+    let ok = RememberOverlayKey();
+    if let Some(ov) = overlay {
+        PutOverlayContent(ok, move || ov());
+    }
     Column(
         modifier.fill_max_size(),
         Arrangement::Start,
@@ -54,7 +63,9 @@ pub fn Scaffold(
                 Modifier::new().weight(1.0, true),
                 Alignment::TopStart,
                 move || {
+                    // 覆盖层后组合 ⇒ 叠在内容上一层（call_overlay_content 未登记时为空操作）。
                     call_overlay_content(ck);
+                    call_overlay_content(ok);
                 },
             );
             if let Some(bb) = bottom_bar.as_ref() {

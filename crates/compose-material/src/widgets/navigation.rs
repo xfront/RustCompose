@@ -126,12 +126,12 @@ pub fn NavigationBar(items: &[NavItem], selected: MutableState<usize>, modifier:
     );
 }
 
-/// `NavigationRail(items, selected, header)` — M3 侧边导航条（80dp 宽，56×32 胶囊）。
+/// `NavigationRail(items, selected, modifier, header)` — M3 侧边导航条（80dp 宽，56×32 胶囊）。
 pub fn NavigationRail(
     items: &[NavItem],
     selected: MutableState<usize>,
-    header: Option<Box<dyn Fn()>>,
     modifier: Modifier,
+    header: Option<Box<dyn Fn()>>,
 ) {
     let colors = theme_colors();
     let g = glass_spec();
@@ -1149,9 +1149,9 @@ pub fn Carousel(
 
 // ══════════════════════════════ 面包屑 / 分页 / 栏 ══════════════════════════════
 
-/// `Breadcrumb(items, onNavigate)` — M3 面包屑：`label_large`，当前页 `on_surface`，
+/// `Breadcrumb(items, modifier, onNavigate)` — M3 面包屑：`label_large`，当前页 `on_surface`，
 /// 其余 `primary` 可点，分隔符 18dp `on_surface_variant`。
-pub fn Breadcrumb(items: &[String], on_navigate: Option<Box<dyn Fn(usize)>>, modifier: Modifier) {
+pub fn Breadcrumb(items: &[String], modifier: Modifier, on_navigate: Option<Box<dyn Fn(usize)>>) {
     let colors = theme_colors();
     let list: Vec<String> = items.to_vec();
     let key = crate::widgets::overlay::RememberOverlayKey();
@@ -1383,14 +1383,14 @@ pub fn StatusBar(left: &str, right: &str, modifier: Modifier) {
 
 // ════════════════════ Tabs 控制器 / Accordion（navigation 补齐） ════════════════════
 
-/// `Tabs(titles, selected, page)` — 标签栏 + 页面视图（`TabBar`+`TabBarView`）。
+/// `Tabs(titles, selected, modifier, page)` — 标签栏 + 页面视图（`TabBar`+`TabBarView`）。
 ///
 /// 页面内容只在选中页组合（`page(index)` 单次调用），切换即重组换页。
 pub fn Tabs(
     titles: &[String],
     selected: MutableState<usize>,
-    page: impl Fn(usize) + 'static,
     modifier: Modifier,
+    page: impl Fn(usize) + 'static,
 ) {
     let titles: Vec<String> = titles.to_vec();
     let cur = selected.get();
@@ -1409,12 +1409,12 @@ pub fn Tabs(
     );
 }
 
-/// `Accordion(titles, expanded, page)` — 手风琴（多开，点击标题切换）。
+/// `Accordion(titles, expanded, modifier, page)` — 手风琴（多开，点击标题切换）。
 pub fn Accordion(
     titles: &[String],
     expanded: MutableState<Vec<usize>>,
-    page: impl Fn(usize) + 'static,
     modifier: Modifier,
+    page: impl Fn(usize) + 'static,
 ) {
     let colors = theme_colors();
     let titles: Vec<String> = titles.to_vec();
@@ -1671,15 +1671,15 @@ pub fn Ribbon(
     );
 }
 
-/// `SidebarHeader(title, collapsed, on_toggle) { }` — 侧栏固定标题栏。
+/// `SidebarHeader(title, collapsed, modifier, on_toggle) { }` — 侧栏固定标题栏。
 ///
 /// 置于滚动区**之外**（如侧栏 Column 首行）：左侧标题、右侧折叠/展开切换按钮（«/»）；
 /// 点击调用 `on_toggle`（宿主据此折叠/展开全部分组）。`collapsed` 仅用于决定按钮字形。
 pub fn SidebarHeader(
     title: &str,
     collapsed: bool,
-    on_toggle: impl Fn() + 'static,
     modifier: Modifier,
+    on_toggle: impl Fn() + 'static,
 ) {
     let colors = theme_colors();
     let t = title.to_string();

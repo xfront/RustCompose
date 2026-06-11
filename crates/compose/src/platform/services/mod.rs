@@ -8,6 +8,7 @@
 //! | 剪贴板 | [`clipboard`] | `Clipboard` |
 //! | 权限 | [`permission`] | `permission_handler` |
 //! | 文件对话框 | [`file_dialog`] | （必备能力，桌面 rfd） |
+//! | 网络请求 | [`network`] | `http` / `dart:io HttpClient` |
 //! | 应用生命周期 | [`lifecycle`] | `AppLifecycleState` |
 //! | 统一错误 | [`error`] | `PlatformException` |
 //!
@@ -34,4 +35,5 @@ pub mod clipboard;
 pub mod error;
 pub mod file_dialog;
 pub mod lifecycle;
+pub mod network;
 pub mod permission;

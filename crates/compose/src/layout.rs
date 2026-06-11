@@ -4,6 +4,12 @@
 //! - `Constraints` 单趟测量（每个孩子只测一次，weight 孩子最后测）
 //! - `MeasurePolicy`：父定约束、子测尺寸、父落位
 //! - 绘制产出平台无关 `DrawCmd` 序列（valo 转换层在 compose-desktop）
+//! - `Modifier` 支持带身份的 `Modifier.Node`（`modifier_node` 模块，对齐 Compose
+//!   `Modifier.Node` / `ModifierNodeElement`）：按链序参与 measure/draw 阶段
+//! - `SubcomposeLayout`：measure 期 `MeasureCtx::subcompose(slot, content)` 请求按需组合，
+//!   引擎在无借用间隙 keyed 组合并重测（两趟，对齐 Compose `SubcomposeLayout`）
+//! - `GraphicsLayer`：`Modifier.graphicsLayer/alpha/rotate/scale` 生成 `SaveLayer/Transform/
+//!   Restore` 命令，子树整体图层合成（对齐 Compose `GraphicsLayer`）
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -41,6 +47,9 @@ pub struct Node {
     /// 次要按钮（鼠标右键）点击处理（take-put 调用防重入）。
     /// 沿祖先链找最近的处理器，**不**回落到 `on_click`：桌面右键不应触发左键行为。
     pub on_secondary_click: Option<Box<dyn FnMut()>>,
+    /// 中间按钮（鼠标中键）点击处理（take-put 调用防重入）。
+    /// 沿祖先链找最近的处理器，不回落到 `on_click`/`on_secondary_click`。
+    pub on_middle_click: Option<Box<dyn FnMut()>>,
     /// 按下处理（take-put 调用防重入）：**指针按下即触发**，用于需要在抬起前就开始的手势
     /// （分栏拖拽、滑杆按住拖动）。Flutter 的 `onTap` 在抬起时触发，故这类控件必须走这里。
     pub on_press: Option<Box<dyn FnMut()>>,
@@ -107,6 +116,7 @@ impl Node {
             owner_scope: None,
             on_click: None,
             on_secondary_click: None,
+            on_middle_click: None,
             on_press: None,
             key_handler: None,
             hover_handler: None,
@@ -142,16 +152,41 @@ pub struct ScrollInfo {
 
 /// 标记节点本身 + 全部祖先为脏（作用域重组 / 几何变化时，保证祖先不被「跳过」而漏掉本节点）。
 thread_local! {
-    /// 是否有节点自上次绘制遍历以来被标记失效（对齐 Compose「layer 失效汇总」）。
-    /// 逐节点图层不再将子树命令嵌入祖先，故不需要「沿祖先链置标记」来传递汇总信号。
-    static RENDER_DIRTY: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
-    /// 是否已完成过至少一次绘制遍历（首帧必须画）。
-    static SCENE_WALKED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// 各组合根的绘制失效标记（对齐 Compose「layer 失效汇总」）。
+    ///
+    /// 按根分开记：多窗口下 A 窗口的绘制遍历不能消费 B 窗口的脏标记，否则 B 会走
+    /// 「画面已 settled」快路径而被冻结在旧画面。
+    static RENDER_DIRTY_ROOTS: RefCell<std::collections::HashSet<NodeId>> =
+        RefCell::new(std::collections::HashSet::new());
+    /// 无从归属到某个根的失效序号（调用方不在组合/布局/输入上下文，每次 +1）。
+    /// 根下次绘制遍历时记下所见序号；两者不等即意味着「遍历后又发生了未知失效」→ 需重绘。
+    static RENDER_DIRTY_UNKNOWN: Cell<u64> = const { Cell::new(0) };
+    /// 各根最近一次绘制遍历时的未知失效序号（无此条目 = 从未遍历过，首帧必画）。
+    static SCENE_WALKED_ROOTS: RefCell<HashMap<NodeId, u64>> = RefCell::new(HashMap::new());
 }
 
 #[inline]
 fn mark_render_dirty() {
-    RENDER_DIRTY.with(|c| c.set(true));
+    match current_root() {
+        Some(root) => {
+            RENDER_DIRTY_ROOTS.with(|s| {
+                s.borrow_mut().insert(root);
+            });
+        }
+        None => {
+            let e = RENDER_DIRTY_UNKNOWN.with(|c| c.get());
+            RENDER_DIRTY_UNKNOWN.with(|c| c.set(e.wrapping_add(1)));
+        }
+    }
+}
+
+/// 节点所属组合根（沿父链走到顶）。
+fn root_of(rt: &Rt, id: NodeId) -> NodeId {
+    let mut cur = id;
+    while let Some(p) = rt.nodes[cur.index()].parent {
+        cur = p;
+    }
+    cur
 }
 
 pub(crate) fn mark_dirty_path(rt: &mut Rt, mut id: NodeId) {
@@ -214,10 +249,16 @@ pub(crate) fn mark_draw_invalid_subtree(rt: &mut Rt, id: NodeId) {
 /// - 向下：孩子自己的片段嵌在孩子的图层缓存里，只标自身仍会回放旧孩子命令（光标/高亮冻结）；
 /// - 向上：祖先链一并失效，保证任何以「祖先是否脏」为判据的回放路径都不会跳过本子树。
 pub fn invalidate_draw_node(id: NodeId) {
+    // 时间相关绘制由帧驱动调用（不在组合/布局上下文）：用节点父链定位所属根，
+    // 使失效只落到该窗口（否则会成为「无根上下文」而把所有窗口标脏）。
+    let prev = current_root();
+    let root = crate::runtime::with_rt_pub(|rt| root_of(rt, id));
+    set_current_root(Some(root));
     crate::runtime::with_rt_pub(|rt| {
         mark_draw_invalid_subtree(rt, id);
         mark_draw_invalid_path(rt, id);
     });
+    set_current_root(prev);
 }
 
 // ══════════════════════════════ Modifier ══════════════════════════════
@@ -343,6 +384,15 @@ pub(crate) enum ModElem {
         gap: f32,
         match_width: bool,
     },
+    /// 锚定到**窗口全局坐标**：落位期把 `(x, y)` 减去父节点的绝对位置得到父内偏移。
+    ///
+    /// 浮层坐标常来自 `last_pointer_global()` 等窗口坐标，而宿主根节点未必位于
+    /// `(0, 0)`（IDE 外壳的菜单栏/状态栏之下、带 padding 的内容区等）。此时若用
+    /// `Offset`，全局坐标会被当成局部位移，浮层整体偏移到布局中部或窗外。
+    PinAt {
+        x: f32,
+        y: f32,
+    },
     Align(Alignment),
     Weight(f32, bool),
     Clip(f32),
@@ -351,6 +401,14 @@ pub(crate) enum ModElem {
     },
     /// 命中测试穿透：本节点（含子树）不参与 `hit_test`（纯装饰浮层用）。
     NoHit,
+    /// 自定义命中区（窗口全局坐标）：只改命中，不参与测量/落位。
+    /// 用于零尺寸的全屏 barrier（菜单外点击收起）——不撑大父容器布局。
+    HitArea {
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+    },
     /// 关闭按压波纹：本节点被点击时不画波纹。
     ///
     /// 波纹默认对所有带 `on_click` 的节点开启（对齐 Flutter `InkWell`），因此需要例外的是
@@ -362,6 +420,23 @@ pub(crate) enum ModElem {
     /// 也不在交叉轴预留 gutter（TabRow 等靠自动滚入视口而非滚动条导航的场景）。
     /// 只影响绘制与预留，不改滚动能力。
     NoScrollbar,
+    /// 自定义 Modifier.Node（对齐 Compose `Modifier.Node`）：带身份与生命周期，
+    /// 按链序参与 measure / draw / hit 阶段。节点存 `modifier_node` arena。
+    Node(crate::modifier_node::ModifierNodeId),
+    /// GraphicsLayer（对齐 Compose `Modifier.graphicsLayer`）：子树作为独立图层合成，
+    /// 整体施加 alpha / 缩放 / 旋转 / 平移，围绕 `(pivot_x, pivot_y)` 变换。
+    GraphicsLayer {
+        alpha: f32,
+        scale_x: f32,
+        scale_y: f32,
+        rotation: f32,
+        translation_x: f32,
+        translation_y: f32,
+        pivot_x: f32,
+        pivot_y: f32,
+    },
+    /// 语义配置（对齐 Compose `Modifier.semantics`）：描述角色的标签/状态/动作。
+    Semantics(crate::semantics::SemanticsConfig),
 }
 
 impl Modifier {
@@ -373,7 +448,7 @@ impl Modifier {
         self.padding_hv(all, all)
     }
     pub fn padding_hv(self, horizontal: f32, vertical: f32) -> Modifier {
-        self.then(ModElem::Padding {
+        self.push_elem(ModElem::Padding {
             left: horizontal,
             top: vertical,
             right: horizontal,
@@ -381,7 +456,7 @@ impl Modifier {
         })
     }
     pub fn padding_ltrb(self, left: f32, top: f32, right: f32, bottom: f32) -> Modifier {
-        self.then(ModElem::Padding {
+        self.push_elem(ModElem::Padding {
             left,
             top,
             right,
@@ -389,40 +464,40 @@ impl Modifier {
         })
     }
     pub fn width(self, w: f32) -> Modifier {
-        self.then(ModElem::Size {
+        self.push_elem(ModElem::Size {
             width: Some(w),
             height: None,
         })
     }
     pub fn height(self, h: f32) -> Modifier {
-        self.then(ModElem::Size {
+        self.push_elem(ModElem::Size {
             width: None,
             height: Some(h),
         })
     }
     pub fn size(self, w: f32, h: f32) -> Modifier {
-        self.then(ModElem::Size {
+        self.push_elem(ModElem::Size {
             width: Some(w),
             height: Some(h),
         })
     }
     /// 最小宽度（Compose `defaultMinSize(minWidth = …)`）。
     pub fn min_width(self, w: f32) -> Modifier {
-        self.then(ModElem::MinSize {
+        self.push_elem(ModElem::MinSize {
             width: Some(w),
             height: None,
         })
     }
     /// 最小高度（Compose `defaultMinSize(minHeight = …)`）。
     pub fn min_height(self, h: f32) -> Modifier {
-        self.then(ModElem::MinSize {
+        self.push_elem(ModElem::MinSize {
             width: None,
             height: Some(h),
         })
     }
     /// 最小宽高（Compose `defaultMinSize`）。
     pub fn min_size(self, w: f32, h: f32) -> Modifier {
-        self.then(ModElem::MinSize {
+        self.push_elem(ModElem::MinSize {
             width: Some(w),
             height: Some(h),
         })
@@ -432,43 +507,43 @@ impl Modifier {
     /// 竖向展开动画的基础：把 `max_height` 从 0 逐帧动画到内容高度，父容器每帧重排即可
     /// （配 `.clip(0)` 裁掉溢出部分）。
     pub fn max_height(self, h: f32) -> Modifier {
-        self.then(ModElem::MaxHeight(h))
+        self.push_elem(ModElem::MaxHeight(h))
     }
     /// 最大宽度（Compose `widthIn(max = …)`）。只收紧上界，内容更窄时仍按自然宽度输出。
     ///
     /// 文本气泡 / 卡片正文的换行宽度上界：内容超宽时折行，不足时保持紧凑。
     pub fn max_width(self, w: f32) -> Modifier {
-        self.then(ModElem::MaxWidth(w))
+        self.push_elem(ModElem::MaxWidth(w))
     }
     /// 竖向展开：内容按自然高度测量，本节点高度取 `frac ×` 自然高度。
     ///
     /// 配 `.clip(0)` 裁掉溢出，即 Compose `expandVertically` 的效果。与
     /// `max_height` 的区别：后者会把约束传给内容（内容被压扁），本修饰符不会。
     pub fn reveal_height(self, frac: f32) -> Modifier {
-        self.then(ModElem::Reveal(frac.clamp(0.0, 1.0)))
+        self.push_elem(ModElem::Reveal(frac.clamp(0.0, 1.0)))
     }
     pub fn fill_max_width(self) -> Modifier {
         self.fill_max_width_frac(1.0)
     }
     pub fn fill_max_width_frac(self, f: f32) -> Modifier {
-        self.then(ModElem::FillMaxWidth(f))
+        self.push_elem(ModElem::FillMaxWidth(f))
     }
     pub fn fill_max_height(self) -> Modifier {
         self.fill_max_height_frac(1.0)
     }
     pub fn fill_max_height_frac(self, f: f32) -> Modifier {
-        self.then(ModElem::FillMaxHeight(f))
+        self.push_elem(ModElem::FillMaxHeight(f))
     }
     pub fn fill_max_size(self) -> Modifier {
         self.fill_max_width().fill_max_height()
     }
     pub fn background(self, color: Color, radius: f32) -> Modifier {
-        self.then(ModElem::Background { color, radius })
+        self.push_elem(ModElem::Background { color, radius })
     }
 
     /// 上→下线性渐变背景（页头 / 英雄卡）。
     pub fn background_gradient(self, from: Color, to: Color, radius: f32) -> Modifier {
-        self.then(ModElem::BackgroundGradient {
+        self.push_elem(ModElem::BackgroundGradient {
             from,
             to,
             radius,
@@ -478,7 +553,7 @@ impl Modifier {
 
     /// 左→右线性渐变背景。
     pub fn background_gradient_h(self, from: Color, to: Color, radius: f32) -> Modifier {
-        self.then(ModElem::BackgroundGradient {
+        self.push_elem(ModElem::BackgroundGradient {
             from,
             to,
             radius,
@@ -487,10 +562,10 @@ impl Modifier {
     }
     /// 液态玻璃背景：`enabled` 为真时走背景模糊材质，否则控件自行退回不透明底色。
     pub fn glass(self, spec: GlassSpec) -> Modifier {
-        self.then(ModElem::Glass(spec))
+        self.push_elem(ModElem::Glass(spec))
     }
     pub fn border(self, width: f32, color: Color, radius: f32) -> Modifier {
-        self.then(ModElem::Border {
+        self.push_elem(ModElem::Border {
             width,
             color,
             radius,
@@ -501,73 +576,213 @@ impl Modifier {
     /// `elevation` 用 M3 的 0/1/3/6/8/12 档位；投影用同心圆角矩形叠加近似模糊，
     /// 因此只适合静态表面（卡片 / FAB / 对话框），不适合每帧移动的元件。
     pub fn shadow(self, elevation: f32, radius: f32, color: Color) -> Modifier {
-        self.then(ModElem::Shadow {
+        self.push_elem(ModElem::Shadow {
             elevation,
             radius,
             color,
         })
     }
     pub fn offset(self, x: f32, y: f32) -> Modifier {
-        self.then(ModElem::Offset { x, y })
+        self.push_elem(ModElem::Offset { x, y })
     }
     /// 锚定到 `anchor` 节点正下方 + gap（布局期解析，见 [`ModElem::PinTo`]）。
     pub fn pin_below(self, anchor: NodeId, gap: f32) -> Modifier {
-        self.then(ModElem::PinTo {
+        self.push_elem(ModElem::PinTo {
             anchor,
             dx: 0.0,
             gap,
             match_width: false,
         })
     }
+    /// 锚定到 `anchor` 下方 + `gap`，并横向平移 `dx`（布局期解析）。
+    /// 用于与锚点同宽的交互格等需要「x 对齐锚点、y 由 gap 微调」的场景。
+    pub fn pin_to(self, anchor: NodeId, dx: f32, gap: f32) -> Self {
+        self.push_elem(ModElem::PinTo {
+            anchor,
+            dx,
+            gap,
+            match_width: false,
+        })
+    }
+
     /// 同 [`Modifier::pin_below`]，且宽度不小于锚点宽度（下拉面板对齐触发框）。
     pub fn pin_below_width(self, anchor: NodeId, gap: f32) -> Modifier {
-        self.then(ModElem::PinTo {
+        self.push_elem(ModElem::PinTo {
             anchor,
             dx: 0.0,
             gap,
             match_width: true,
         })
     }
+    /// 把浮层左上角锚定到**窗口全局坐标** `(x, y)`（布局期换算，见 [`ModElem::PinAt`]）。
+    ///
+    /// 与 `offset` 的区别：`offset` 是父容器内的相对位移；这里的坐标来自指针事件，
+    /// 宿主根节点自身可能带偏移。另会自动按视口边界夹取，使浮层完整落在窗口内。
+    pub fn pin_at_global(self, x: f32, y: f32) -> Modifier {
+        self.push_elem(ModElem::PinAt { x, y })
+    }
     /// Box 内对齐。
     pub fn align(self, a: Alignment) -> Modifier {
-        self.then(ModElem::Align(a))
+        self.push_elem(ModElem::Align(a))
     }
     /// Row/Column 内权重（对齐 `RowScope.weight`）。
     pub fn weight(self, w: f32, fill: bool) -> Modifier {
-        self.then(ModElem::Weight(w, fill))
+        self.push_elem(ModElem::Weight(w, fill))
     }
     pub fn clip(self, radius: f32) -> Modifier {
-        self.then(ModElem::Clip(radius))
+        self.push_elem(ModElem::Clip(radius))
     }
+
+    /// GraphicsLayer：子树整体 alpha / 缩放 / 旋转 / 平移（对齐 Compose `graphicsLayer`）。
+    /// `pivot_x/pivot_y` 为 0..1 相对自身尺寸的比例（0.5 = 中心）。
+    pub fn graphics_layer(
+        self,
+        alpha: f32,
+        scale_x: f32,
+        scale_y: f32,
+        rotation: f32,
+        translation_x: f32,
+        translation_y: f32,
+        pivot_x: f32,
+        pivot_y: f32,
+    ) -> Modifier {
+        self.push_elem(ModElem::GraphicsLayer {
+            alpha: alpha.clamp(0.0, 1.0),
+            scale_x,
+            scale_y,
+            rotation,
+            translation_x,
+            translation_y,
+            pivot_x,
+            pivot_y,
+        })
+    }
+
+    /// 便捷：仅整体透明度（对齐 `Modifier.alpha`）。
+    pub fn alpha(self, a: f32) -> Modifier {
+        self.graphics_layer(a, 1.0, 1.0, 0.0, 0.0, 0.0, 0.5, 0.5)
+    }
+
+    /// 便捷：仅旋转（度，围绕中心）。
+    pub fn rotate(self, degrees: f32) -> Modifier {
+        self.graphics_layer(1.0, 1.0, 1.0, degrees, 0.0, 0.0, 0.5, 0.5)
+    }
+
+    /// 便捷：仅缩放（围绕中心）。
+    pub fn scale(self, sx: f32, sy: f32) -> Modifier {
+        self.graphics_layer(1.0, sx, sy, 0.0, 0.0, 0.0, 0.5, 0.5)
+    }
+
+    /// 语义配置（对齐 Compose `Modifier.semantics { ... }`）。
+    pub fn semantics(self, configure: impl FnOnce(&mut crate::semantics::SemanticsConfig)) -> Modifier {
+        let mut config = crate::semantics::SemanticsConfig::new();
+        configure(&mut config);
+        self.push_elem(ModElem::Semantics(config))
+    }
+
+    /// contentDescription（对齐 Compose `contentDescription`），图标等无文本控件必填。
+    pub fn content_description(self, desc: impl Into<String>) -> Modifier {
+        self.semantics(|c| {
+            c.set(crate::semantics::CONTENT_DESCRIPTION, desc.into());
+        })
+    }
+
+    /// testTag（对齐 Compose `testTag`，供测试/自动化查找）。
+    pub fn test_tag(self, tag: impl Into<String>) -> Modifier {
+        self.semantics(|c| {
+            c.set(crate::semantics::TEST_TAG, tag.into());
+        })
+    }
+
+    /// 语义角色（对齐 Compose `Role`）。
+    pub fn role(self, role: crate::semantics::Role) -> Modifier {
+        self.semantics(|c| {
+            c.set(crate::semantics::ROLE, role);
+        })
+    }
+
+    /// 合并后代语义（对齐 Compose `mergeDescendants = true`）。
+    pub fn merge_descendants(self) -> Modifier {
+        self.semantics(|c| c.merge_descendants = true)
+    }
+
+    /// 清除并覆盖后代语义（对齐 Compose `clearAndSetSemantics { ... }`）。
+    pub fn clear_and_set_semantics(
+        self,
+        configure: impl FnOnce(&mut crate::semantics::SemanticsConfig),
+    ) -> Modifier {
+        let mut config = crate::semantics::SemanticsConfig::new();
+        config.clear_descendants = true;
+        configure(&mut config);
+        self.push_elem(ModElem::Semantics(config))
+    }
+
+    /// 从语义树隐藏（对齐 Compose `clearAndSetSemantics {}` / `invisibleToUser`）。
+    pub fn hide_from_accessibility(self) -> Modifier {
+        self.semantics(|c| c.hidden = true)
+    }
+
     /// 标记为滚动容器（本节点主轴可滚）。
     pub fn VerticalScroll(self) -> Modifier {
-        self.then(ModElem::Scroll { vertical: true })
+        self.push_elem(ModElem::Scroll { vertical: true })
     }
     pub fn HorizontalScroll(self) -> Modifier {
-        self.then(ModElem::Scroll { vertical: false })
+        self.push_elem(ModElem::Scroll { vertical: false })
     }
     /// 隐藏本滚动容器的滚动条（仍可用滚轮/拖拽滚动，但不绘制、不预留 gutter）。
     pub fn hide_scrollbar(self) -> Modifier {
-        self.then(ModElem::NoScrollbar)
+        self.push_elem(ModElem::NoScrollbar)
     }
     /// 命中测试穿透：本节点（含子树）不接受点击/悬停命中，事件落到其下方的兄弟或父级。
     ///
     /// 用于覆盖层（聚焦外框、装饰性描边等）——它们绘制在内容之上但不该吃掉事件。
     pub fn no_hit(self) -> Modifier {
-        self.then(ModElem::NoHit)
+        self.push_elem(ModElem::NoHit)
     }
 
     /// 关闭按压波纹：本节点点击时不画波纹（默认对所有 `on_click` 节点开启）。
     ///
     /// 用于「整屏遮罩」——点一下就关，波纹糊满全屏只会难看（Flutter 的 modal barrier 同样无波）。
     pub fn no_indication(self) -> Modifier {
-        self.then(ModElem::NoIndication)
+        self.push_elem(ModElem::NoIndication)
     }
 
-    fn then(self, e: ModElem) -> Modifier {
+    fn push_elem(self, e: ModElem) -> Modifier {
         let mut m = self;
         m.elems.push(e);
         m
+    }
+
+    /// 拼接两个 Modifier（对齐 Compose `Modifier.then`）：`other` 的元素追加在本链之后，
+    /// 链序即包裹顺序（measure 阶段后写约束覆盖先写）。
+    pub fn then(mut self, other: Modifier) -> Modifier {
+        self.elems.extend(other.elems);
+        self
+    }
+
+    /// 条件拼接（对齐 Compose `Modifier.thenIf(condition) { ... }`）。
+    pub fn then_if(self, condition: bool, other: impl FnOnce() -> Modifier) -> Modifier {
+        if condition {
+            self.then(other())
+        } else {
+            self
+        }
+    }
+
+    /// 追加一个自定义 `Modifier.Node` 句柄（对齐 Compose 节点链）。
+    pub fn with_node(self, id: crate::modifier_node::ModifierNodeId) -> Modifier {
+        self.push_elem(ModElem::Node(id))
+    }
+
+    /// 本链中所有自定义节点句柄（按书写顺序）。
+    pub fn node_ids(&self) -> Vec<crate::modifier_node::ModifierNodeId> {
+        self.elems
+            .iter()
+            .filter_map(|e| match e {
+                ModElem::Node(id) => Some(*id),
+                _ => None,
+            })
+            .collect()
     }
 
     pub(crate) fn padding_of(&self) -> (f32, f32, f32, f32) {
@@ -614,8 +829,30 @@ impl Modifier {
         })
     }
 
+    /// [`ModElem::PinAt`] 的窗口全局锚点（若有）。
+    pub(crate) fn pin_at_of(&self) -> Option<(f32, f32)> {
+        self.elems.iter().find_map(|e| match e {
+            ModElem::PinAt { x, y } => Some((*x, *y)),
+            _ => None,
+        })
+    }
+
     pub(crate) fn is_no_hit(&self) -> bool {
         self.elems.iter().any(|e| matches!(e, ModElem::NoHit))
+    }
+
+    /// 自定义命中区（窗口全局坐标），只影响命中测试、不改变布局尺寸。
+    pub fn hit_area(x: f32, y: f32, w: f32, h: f32) -> Self {
+        Self {
+            elems: vec![ModElem::HitArea { x, y, w, h }],
+        }
+    }
+
+    pub(crate) fn hit_area_of(&self) -> Option<(f32, f32, f32, f32)> {
+        self.elems.iter().find_map(|e| match e {
+            ModElem::HitArea { x, y, w, h } => Some((*x, *y, *w, *h)),
+            _ => None,
+        })
     }
 
     /// 本节点是否关闭了按压波纹。
@@ -626,6 +863,12 @@ impl Modifier {
     /// 本滚动容器是否隐藏了滚动条（`Modifier::hide_scrollbar`）。
     pub fn scrollbar_hidden(&self) -> bool {
         self.elems.iter().any(|e| matches!(e, ModElem::NoScrollbar))
+    }
+
+    /// 本节点是否裁剪孩子（`clip` 修饰符）：越界孩子不可见也不可命中
+    /// （命中测试据此决定是否按 bounds 剪枝，见 `hit_node`）。
+    pub fn is_clipped(&self) -> bool {
+        self.elems.iter().any(|e| matches!(e, ModElem::Clip(_)))
     }
 }
 
@@ -721,9 +964,21 @@ pub struct MeasureResult {
 /// 测量上下文（借道 &mut RuntimeData，避免重入）。
 pub struct MeasureCtx<'a> {
     pub(crate) rt: &'a mut Rt,
+    /// 当前节点的重组作用域（SubcomposeLayout 用其作为子组合父作用域）。
+    pub(crate) owner: Option<ScopeId>,
 }
 
 impl<'a> MeasureCtx<'a> {
+    /// measure 期请求按 slot 组合子内容（对齐 Compose `SubcomposeLayout.subcompose`）。
+    ///
+    /// 请求排入队列，在本轮 measure 结束后的无借用间隙由 `perform_layout` 执行，
+    /// 随后重新测量使子内容尺寸反馈到父布局。
+    pub fn subcompose(&mut self, slot: u64, content: impl Fn() + 'static) {
+        if let Some(owner) = self.owner {
+            crate::subcompose::subcompose(owner, slot, content);
+        }
+    }
+
     /// 测量子节点（每个孩子一趟 — Compose 单趟测量契约）。
     pub fn measure(&mut self, id: NodeId, constraints: Constraints) -> Placeable {
         let (w, h) = measure_node(self.rt, id, constraints);
@@ -780,7 +1035,11 @@ pub fn add_node(policy: Policy, modifier: Modifier) -> NodeId {
             }
         };
         if let Some(p) = parent {
-            rt.nodes[p.index()].children.push(id);
+            // 对齐 Compose Applier：插入由可替换的 applier 执行（默认 ArenaApplier 追加）。
+            crate::applier::apply(
+                |ap, rt| ap.insert_bottom_up(rt, p, rt.nodes[p.index()].children.len(), id),
+                rt,
+            );
         }
         id
     })
@@ -835,7 +1094,14 @@ pub(crate) fn sweep_nodes() {
                 continue;
             }
             if let Some(p) = rt.nodes[i].parent {
-                rt.nodes[p.index()].children.retain(|c| *c != NodeId(i as u32));
+                // 对齐 Compose Applier.remove：GC 摘除走 applier。
+                let pos = rt.nodes[p.index()]
+                    .children
+                    .iter()
+                    .position(|c| *c == NodeId(i as u32));
+                if let Some(at) = pos {
+                    crate::applier::apply(|ap, rt| ap.remove(rt, p, at, 1), rt);
+                }
             }
             if std::env::var_os("COMPOSE_DEBUG_GC").is_some() {
                 eprintln!("[gc] free node={} owner={:?}", i, rt.nodes[i].owner_scope.map(|o| o.0));
@@ -849,6 +1115,30 @@ pub(crate) fn sweep_nodes() {
             }
         }
     });
+}
+
+/// 释放单个节点槽位（组合根销毁时用）。
+///
+/// 可达性 GC 把「alive && 无父节点」视为独立根，故组合根不能交给 GC 判死，
+/// 必须在摘除 `root_nodes` 后显式归还槽位；其子树已由作用域销毁的 applier clear 摘除。
+pub(crate) fn release_node(rt: &mut Rt, id: NodeId) {
+    let i = id.index();
+    if i >= rt.nodes.len() || !rt.nodes[i].alive {
+        return;
+    }
+    if let Some(p) = rt.nodes[i].parent {
+        let pos = rt.nodes[p.index()].children.iter().position(|c| *c == id);
+        if let Some(at) = pos {
+            crate::applier::apply(|ap, rt| ap.remove(rt, p, at, 1), rt);
+        }
+    }
+    let mut dead = Node::new(Policy::Box(Alignment::TopStart), Modifier::new());
+    dead.alive = false;
+    rt.nodes[i] = dead;
+    rt.node_free.push(i as u32);
+    if rt.hovered_node == Some(i) {
+        rt.hovered_node = None;
+    }
 }
 
 /// 以节点为父运行内容作用域（组合容器 widget 的实现核心）。
@@ -931,6 +1221,10 @@ fn apply_measure_mods(mods: &Modifier, incoming: Constraints) -> ModMeasure {
                 if incoming.has_bounded_height() {
                     mm.fill_h = Some(incoming.max_height * f);
                 }
+            }
+            // 自定义 Modifier.Node 按链序参与测量（对齐 Compose measure 阶段）。
+            ModElem::Node(id) => {
+                mm.content = crate::modifier_node::measure_one(*id, mm.content);
             }
             _ => {}
         }
@@ -1082,7 +1376,8 @@ fn measure_policy(rt: &mut Rt, id: NodeId, constraints: Constraints) -> (f32, f3
         Policy::Custom(_) => {
             // ctx 桥：Custom 策略通过 MeasureCtx 访问同一 rt（无重入）
             let children = rt.nodes[id.index()].children.clone();
-            let mut ctx = MeasureCtx { rt };
+            let owner = rt.nodes[id.index()].owner_scope;
+            let mut ctx = MeasureCtx { rt, owner };
             if let Policy::Custom(p) = &mut policy {
                 let r = p.measure(&mut ctx, &children, constraints);
                 // 落位记入节点（place 阶段读取）
@@ -1287,26 +1582,74 @@ pub(crate) fn invalidate_all(rt: &mut Rt) {
     }
 }
 
+/// 把某个组合根的整棵子树标记为脏。
+///
+/// 多窗口下每个窗口一个根、彼此是不相交的节点树：某个窗口尺寸变化只能失效它自己的树
+/// （旧实现 `invalidate_all` 会连另一个窗口一起重布局，两个不同尺寸的窗口每帧互相打架）。
+pub(crate) fn invalidate_tree(rt: &mut Rt, root: NodeId) {
+    let mut stack = vec![root];
+    while let Some(id) = stack.pop() {
+        let i = id.index();
+        if i >= rt.nodes.len() || !rt.nodes[i].alive {
+            continue;
+        }
+        rt.nodes[i].dirty = true;
+        rt.nodes[i].last_geo = None;
+        for k in 0..rt.nodes[i].children.len() {
+            stack.push(rt.nodes[i].children[k]);
+        }
+    }
+}
+
 /// 布局入口：测量根 + 落位到 (0,0)。
 pub fn perform_layout(root: NodeId, constraints: Constraints) -> Size {
     MEASURED.with(|c| c.set(0));
     PLACED.with(|c| c.set(0));
-    crate::runtime::with_rt_pub(|rt| {
-        // 约束变化（窗口尺寸变化）→ 整树失效重布局，避免跳过逻辑使用陈旧几何。
-        let changed = rt.last_constraints != Some(constraints);
-        if changed {
-            invalidate_all(rt);
-            rt.last_constraints = Some(constraints);
-        } else if !rt.nodes[root.index()].dirty {
-            // 增量布局：无失效标记且约束未变 → 整树几何已稳定，
-            // 跳过 measure/place 递归与 O(N) 滚动结算循环（空闲帧近乎零成本）。
-            // 任何脏（重组 / 几何 / 滚动）都会经 mark_dirty_path 传导至根，故根不脏即全树不脏。
-            let n = &rt.nodes[root.index()];
-            return Size::new(n.width, n.height);
+    // 清掉上一轮未消费的残留请求（正常路径每轮都会 drain）。
+    let _ = crate::subcompose::drain_requests();
+
+    const MAX_SUBCOMPOSE_ROUNDS: usize = 8;
+    let mut rounds = 0usize;
+    loop {
+        let (w, h, produced) = crate::runtime::with_rt_pub(|rt| {
+            // 约束变化（窗口尺寸变化）→ 本根整树失效重布局，避免跳过逻辑使用陈旧几何。
+            // 约束按根记录：多窗口各自的尺寸互不干扰。
+            let changed = rt.last_constraints.get(&root).copied() != Some(constraints);
+            if changed {
+                invalidate_tree(rt, root);
+                rt.last_constraints.insert(root, constraints);
+            } else if !rt.nodes[root.index()].dirty && rounds == 0 {
+                // 增量布局：无失效标记且约束未变 → 整树几何已稳定，
+                // 跳过 measure/place 递归与 O(N) 滚动结算循环（空闲帧近乎零成本）。
+                let n = &rt.nodes[root.index()];
+                return (n.width, n.height, false);
+            }
+            let (w, h) = measure_node(rt, root, constraints);
+            place_node(rt, root, 0.0, 0.0);
+            (w, h, crate::subcompose::pending() > 0)
+        });
+        if produced && rounds < MAX_SUBCOMPOSE_ROUNDS {
+            // 在无 RUNTIME 借用时执行 measure 期排队的子组合，再重测一轮让尺寸反馈到父。
+            crate::subcompose::drain_requests();
+            rounds += 1;
+            continue;
         }
-        let (w, h) = measure_node(rt, root, constraints);
-        place_node(rt, root, 0.0, 0.0);
-        Size::new(w, h)
+        let _ = crate::subcompose::drain_requests();
+        return Size::new(w, h);
+    }
+}
+
+/// 节点绝对边界（语义树 / 无障碍桥接用；要求已完成布局）。
+pub fn node_absolute_bounds(id: NodeId) -> crate::semantics::SemanticsBounds {
+    crate::runtime::with_rt_pub(|rt| {
+        let (x, y) = node_abs_pos(rt, id);
+        let n = &rt.nodes[id.index()];
+        crate::semantics::SemanticsBounds {
+            x,
+            y,
+            width: n.width,
+            height: n.height,
+        }
     })
 }
 
@@ -1337,13 +1680,18 @@ fn place_node(rt: &mut Rt, id: NodeId, x: f32, y: f32) {
     PLACED.with(|c| c.set(c.get() + 1));
     // `Modifier.offset`：落位时整体平移（含子树），不影响测量 — Compose 语义。
     let (ofx, ofy) = rt.nodes[id.index()].modifier.offset_of();
-    // `Modifier.pin_to`：落位期解析锚点绝对位置（锚点子树先于本节点落位）。
+    // `Modifier.pin_below` / `pin_at_global`：落位期解析绝对位置（组合期几何尚未就绪，
+    // 此时锚点子树与父节点已完成落位）。
     let pin = rt.nodes[id.index()].modifier.pin_of();
-    let pin_pos = pin.map(|(anchor, pdx, gap, _mw)| {
-        let ah = rt.nodes[anchor.index()].height;
-        let (ax, ay) = node_abs_pos(rt, anchor);
-        (ax + pdx, ay + ah + gap)
-    });
+    let pin_at = rt.nodes[id.index()].modifier.pin_at_of();
+    let is_pin_at = pin.is_none() && pin_at.is_some();
+    let pin_pos = pin
+        .map(|(anchor, pdx, gap, _mw)| {
+            let ah = rt.nodes[anchor.index()].height;
+            let (ax, ay) = node_abs_pos(rt, anchor);
+            (ax + pdx, ay + ah + gap)
+        })
+        .or(pin_at);
     let parent = rt.nodes[id.index()].parent;
     let (ppx, ppy) = if pin_pos.is_some() {
         match parent {
@@ -1359,18 +1707,25 @@ fn place_node(rt: &mut Rt, id: NodeId, x: f32, y: f32) {
         n.y = y + ofy;
         if let Some((tx, ty)) = pin_pos {
             // 锚定后再叠加 `offset`：Compose 的 `offset` 是「落位结果的位移」，
-            // 与位移来源（父链排布 or 锚点绝对位置）无关，漏加即成静默 bug。
+            // 与位移来源（父链排布 / 锚点绝对位置 / 全局坐标）无关，漏加即成静默 bug。
             let mut abs_x = tx + ofx;
+            let mut abs_y = ty + ofy;
             // 浮层智能重定位：面板若伸出窗口左/右边界（如靠右的 TabRow 溢出「⋮」菜单
             // 按内容自然宽展开），则整体平移使其完整落在视口内（留出 4px 边距），
-            // 不被 OS 窗口裁切。面板比视口还宽 / 视口未知时保持原位；纵向溢出交由滚动封顶处理。
-            let vw = viewport_size().0;
+            // 不被 OS 窗口裁切。面板比视口还宽 / 视口未知时保持原位。
+            let (vw, vh) = viewport_size();
             let pw = n.width;
+            let ph = n.height;
             if vw > 0.0 && pw > 0.0 && pw < vw {
                 abs_x = abs_x.min(vw - 4.0 - pw).max(4.0);
             }
+            // `pin_at_global` 的坐标来自指针事件，可能贴近视口底边（底部标签条的「▼」），
+            // 纵向同样夹取；`pin_below` 的纵向溢出仍交由滚动封顶处理。
+            if is_pin_at && vh > 0.0 && ph > 0.0 && ph < vh {
+                abs_y = abs_y.min(vh - 4.0 - ph).max(4.0);
+            }
             n.x = abs_x - ppx;
-            n.y = ty - ppy + ofy;
+            n.y = abs_y - ppy;
         }
     }
     let (cw, ch) = (rt.nodes[id.index()].width, rt.nodes[id.index()].height);
@@ -1657,6 +2012,39 @@ pub enum DrawCmd {
         radius: f32,
     },
     ClipPop,
+    /// GraphicsLayer 起始：把子树合成到独立图层，整体施加 alpha（对齐 Compose `graphicsLayer`）。
+    /// 范围到配对的 [`DrawCmd::Restore`] 为止，类似 `saveLayer`。
+    SaveLayer {
+        alpha: f32,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+    },
+    /// 变换节点：在后续子内容的绘制中施加平移/缩放/旋转（围绕 pivot）。
+    Transform {
+        translate_x: f32,
+        translate_y: f32,
+        scale_x: f32,
+        scale_y: f32,
+        rotation: f32,
+        pivot_x: f32,
+        pivot_y: f32,
+    },
+    /// 结束 GraphicsLayer（`saveLayer`/`transform` 的 restore）。
+    Restore,
+    /// 位图：按 `image_id` 从图像注册表取得 `valo::Image` 绘制；`token` 随解码就绪翻转，
+    /// 使保留模式静态块缓存失效并被重绘（避免解码完成前缓存的占位被永久复用）。
+    /// `opacity` 进内容指纹（同图不同透明度视为不同墨迹）。
+    Image {
+        image_id: u64,
+        token: u64,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        opacity: f32,
+    },
 }
 
 /// 文本样式。
@@ -1878,6 +2266,44 @@ impl std::hash::Hash for DrawCmd {
                 hash_f32(state, *radius);
             }
             C::ClipPop => state.write_u8(11),
+            C::SaveLayer { alpha, x, y, w, h } => {
+                state.write_u8(22);
+                hash_f32(state, *alpha);
+                hash_f32(state, *x);
+                hash_f32(state, *y);
+                hash_f32(state, *w);
+                hash_f32(state, *h);
+            }
+            C::Transform { translate_x, translate_y, scale_x, scale_y, rotation, pivot_x, pivot_y } => {
+                state.write_u8(23);
+                hash_f32(state, *translate_x);
+                hash_f32(state, *translate_y);
+                hash_f32(state, *scale_x);
+                hash_f32(state, *scale_y);
+                hash_f32(state, *rotation);
+                hash_f32(state, *pivot_x);
+                hash_f32(state, *pivot_y);
+            }
+            C::Restore => state.write_u8(24),
+            C::Image {
+                image_id,
+                token,
+                x,
+                y,
+                w,
+                h,
+                opacity,
+            } => {
+                state.write_u8(12);
+                // u64 字段走精确写入（f32 精度不足以容纳 id / token）。
+                state.write_u64(*image_id);
+                state.write_u64(*token);
+                hash_f32(state, *x);
+                hash_f32(state, *y);
+                hash_f32(state, *w);
+                hash_f32(state, *h);
+                hash_f32(state, *opacity);
+            }
         }
     }
 }
@@ -1976,6 +2402,22 @@ impl DrawBuilder {
     pub fn fill_rect(&mut self, x: f32, y: f32, w: f32, h: f32, color: Color) {
         if !self.probe {
             self.cmds.push(DrawCmd::FillRect { x, y, w, h, color });
+        }
+        self.grow(x + w, y + h);
+    }
+    /// 位图：emit `DrawCmd::Image`（按 `image_id` 在渲染层解析纹理）。`token` 进内容指纹，
+    /// 解码就绪翻转后使保留模式静态块失效并被重绘。
+    pub fn image(&mut self, image_id: u64, token: u64, x: f32, y: f32, w: f32, h: f32, opacity: f32) {
+        if !self.probe {
+            self.cmds.push(DrawCmd::Image {
+                image_id,
+                token,
+                x,
+                y,
+                w,
+                h,
+                opacity,
+            });
         }
         self.grow(x + w, y + h);
     }
@@ -2475,7 +2917,7 @@ pub fn draw_tree_tagged(root: NodeId) -> (Vec<DrawCmd>, Vec<u32>) {
         };
         draw_node(rt, root, 0.0, 0.0, &mut out);
     });
-    walk_consumed();
+    walk_consumed(root);
     (cmds, owners)
 }
 
@@ -2496,7 +2938,14 @@ fn layer_part<'r>(rt: &'r Rt, seg: &LayerSeg) -> Option<&'r [DrawCmd]> {
 
 /// 该命令是否改变裁剪栈（决定它能否进可复用的静态块）。
 fn is_clip(c: &DrawCmd) -> bool {
-    matches!(c, DrawCmd::ClipPush { .. } | DrawCmd::ClipPop)
+    matches!(
+        c,
+        DrawCmd::ClipPush { .. }
+            | DrawCmd::ClipPop
+            | DrawCmd::SaveLayer { .. }
+            | DrawCmd::Transform { .. }
+            | DrawCmd::Restore
+    )
 }
 
 /// 保留模式遍历：产出「块计划 + 静态块命令（按需）+ 现场命令」。
@@ -2504,7 +2953,7 @@ fn is_clip(c: &DrawCmd) -> bool {
 /// 原子段的内容指纹缓存在节点图层里，故本帧不重新哈希未变的墨迹；静态块的键只混合
 /// 静态段，动态段增删不会牵动它（story 动画页实测：静态块可连续多帧复用同一份 DisplayList）。
 ///
-/// 一条硬约束：**裁剪指令不进静态块**（`ClipPush`/`ClipPop` 永远现场录制）。
+/// 一条硬约束：**状态栈指令不进静态块**（`ClipPush`/`ClipPop`/`SaveLayer`/`Transform`/`Restore` 永远现场录制）。
 /// 静态块录成 DisplayList 后是被 `draw_display_list` **嵌回原位置**的，valo 在嵌入点
 /// 继承外层裁剪栈，所以块自身只要平衡就等价——而块内不含裁剪进出即天然平衡。
 /// 反过来，一旦把某父节点的 `ClipPush` 关进缓存块，外层构建器的栈就少这一层，
@@ -2601,7 +3050,7 @@ pub fn draw_tree_retained_into(
         state.blks = blks;
     });
     f.static_changed = changed;
-    walk_consumed();
+    walk_consumed(root);
 }
 
 thread_local! {
@@ -2618,16 +3067,25 @@ pub fn scene_changed() -> bool {
 /// 画面是否已 settled：自上次遍历以来无任何节点绘制失效 → 本帧与上一帧逐命令相同，
 /// 平台可跳过整树绘制遍历。
 ///
-/// 汇总信号用全局标记而非「根节点的 `draw_invalid`」：逐节点图层不把子树命令嵌进祖先，
-/// 失效不必再沿祖先链传播（对齐 Compose：layer 失效由 render pass 统一收集）。
-pub fn scene_is_clean(_root: NodeId) -> bool {
-    SCENE_WALKED.with(|w| w.get()) && !RENDER_DIRTY.with(|d| d.get())
+/// 汇总信号用「按根的失效集合」而非根节点的 `draw_invalid`：逐节点图层不把子树命令
+/// 嵌进祖先，失效不必沿祖先链传播（对齐 Compose：layer 失效由 render pass 统一收集）；
+/// 而按根分开记保证多窗口下各窗口的绘制遍历互不消费脏标记。
+pub fn scene_is_clean(root: NodeId) -> bool {
+    let unknown = RENDER_DIRTY_UNKNOWN.with(|c| c.get());
+    let walked = SCENE_WALKED_ROOTS.with(|w| w.borrow().get(&root).copied());
+    walked == Some(unknown) && !RENDER_DIRTY_ROOTS.with(|d| d.borrow().contains(&root))
 }
 
-/// 遍历即消费：失效汇总标记清零、标记「本轮已遍历」，下一帧若无新失效即可走快路径①。
-fn walk_consumed() {
-    SCENE_WALKED.with(|s| s.set(true));
-    RENDER_DIRTY.with(|s| s.set(false));
+/// 遍历即消费：本根的失效标记清零，并记下「已看到当前的未知失效」——
+/// 下一帧无新失效即可走快路径①。
+fn walk_consumed(root: NodeId) {
+    let unknown = RENDER_DIRTY_UNKNOWN.with(|c| c.get());
+    SCENE_WALKED_ROOTS.with(|s| {
+        s.borrow_mut().insert(root, unknown);
+    });
+    RENDER_DIRTY_ROOTS.with(|d| {
+        d.borrow_mut().remove(&root);
+    });
 }
 
 /// M3 elevation → 柔和投影：三层同心圆角矩形叠加，近似模糊（无离屏 pass）。
@@ -2713,6 +3171,42 @@ fn draw_node(rt: &mut Rt, id: NodeId, abs_x: f32, abs_y: f32, out: &mut Out<'_>)
     // 本节点片段缓冲（前缀 / 后缀各一段）：命令写入 out 的同时留档进图层缓存。
     let mut cmds: Vec<DrawCmd> = Vec::new();
 
+    // GraphicsLayer：子树整体作为独立图层合成（对齐 Compose `graphicsLayer`）。
+    // alpha < 1 或非单位变换时开启 saveLayer，否则只发 Transform（减少图层开销）。
+    let layer = mods.elems.iter().find_map(|e| match e {
+        ModElem::GraphicsLayer {
+            alpha,
+            scale_x,
+            scale_y,
+            rotation,
+            translation_x,
+            translation_y,
+            pivot_x,
+            pivot_y,
+        } => Some((*alpha, *scale_x, *scale_y, *rotation, *translation_x, *translation_y, *pivot_x, *pivot_y)),
+        _ => None,
+    });
+    let has_layer = layer.map(|l| l.0 < 0.999).unwrap_or(false);
+    let has_transform = layer.map(|l| {
+        (l.1 - 1.0).abs() > 1e-5 || (l.2 - 1.0).abs() > 1e-5 || l.3.abs() > 1e-5
+            || l.4.abs() > 1e-5 || l.5.abs() > 1e-5
+    }).unwrap_or(false);
+    if has_layer {
+        cmds.push(DrawCmd::SaveLayer { alpha: layer.unwrap().0, x, y, w, h });
+    }
+    if has_transform {
+        let l = layer.unwrap();
+        cmds.push(DrawCmd::Transform {
+            translate_x: l.4,
+            translate_y: l.5,
+            scale_x: l.1,
+            scale_y: l.2,
+            rotation: l.3,
+            pivot_x: l.6,
+            pivot_y: l.7,
+        });
+    }
+
     // 投影在背景之前（M3 elevation：先铺影再铺表面）
     for e in &mods.elems {
         if let ModElem::Shadow { elevation, radius, color } = e {
@@ -2792,6 +3286,18 @@ fn draw_node(rt: &mut Rt, id: NodeId, abs_x: f32, abs_y: f32, out: &mut Out<'_>)
             });
         }
     }
+    // 自定义 Modifier.Node 的 Draw 节点按链序追加（对齐 Compose draw 阶段，自身内容之前）。
+    let node_ids = mods.node_ids();
+    if node_ids.iter().any(|id| {
+        crate::modifier_node::nodes_of_kind(&[*id], crate::modifier_node::ModifierNodeKind::Draw)
+            .len()
+            > 0
+    }) {
+        let mut b = DrawBuilder::with_buffer(cmds);
+        crate::modifier_node::draw_chain(&node_ids, &mut b, x, y, w, h);
+        cmds = b.cmds;
+    }
+
     // clip
     let clip_radius = mods.elems.iter().find_map(|e| match e {
         ModElem::Clip(r) => Some(*r),
@@ -2905,6 +3411,11 @@ fn draw_node(rt: &mut Rt, id: NodeId, abs_x: f32, abs_y: f32, out: &mut Out<'_>)
         suffix.push(DrawCmd::ClipPop);
     }
 
+    // GraphicsLayer 结束：restore 与 prefix 的 SaveLayer/Transform 配对。
+    if has_layer || has_transform {
+        suffix.push(DrawCmd::Restore);
+    }
+
     // ── 图层缓存写回：只有本节点自己的片段变化才算脏区 ──
     // 祖先不嵌入子树命令，因此无需向上失效传播（旧实现每层各自整段深比较 + 两次克隆）。
     let suffix_hash = segment_hash(&suffix);
@@ -2937,7 +3448,16 @@ fn hit_node(rt: &Rt, id: NodeId, px: f32, py: f32, ax: f32, ay: f32) -> Option<(
     }
     let x = ax + n.x;
     let y = ay + n.y;
-    if px < x || py < y || px > x + n.width || py > y + n.height {
+    let in_bounds = match n.modifier.hit_area_of() {
+        // 自定义命中区用窗口全局坐标判定（barrier 节点布局尺寸可为 0）。
+        Some((hx, hy, hw, hh)) => px >= hx && py >= hy && px <= hx + hw && py <= hy + hh,
+        None => px >= x && py >= y && px <= x + n.width && py <= y + n.height,
+    };
+    // 只有**裁剪容器**（clip / 滚动）才把越界点整体剪掉（越界孩子既看不见也点不到）。
+    // 非 clip 容器的 bounds 不含 offset 子项——`Modifier.offset` 不参与测量、落位平移
+    // 可越出父 bounds（对齐 Compose：无 clip 不裁命中），故孩子仍参与命中测试。
+    let clips = n.modifier.is_clipped() || n.scroll.is_some();
+    if !in_bounds && (clips || n.children.is_empty()) {
         return None;
     }
     // 滚动偏移修正（纵向减 y、横向减 x）
@@ -2953,7 +3473,11 @@ fn hit_node(rt: &Rt, id: NodeId, px: f32, py: f32, ax: f32, ay: f32) -> Option<(
             return Some(hit);
         }
     }
-    Some((id, px - x, py - y))
+    if in_bounds {
+        Some((id, px - x, py - y))
+    } else {
+        None
+    }
 }
 
 // 点击坐标（事件分发时记录，Slider 等读取局部坐标）。
@@ -3061,33 +3585,97 @@ pub fn drag_end_global() -> bool {
     had
 }
 
-// ── 通用二维拖拽（取色器 SV 方块等需同时读 x/y 的手势）──
+// ── 通用二维拖拽（取色器 SV 方块 / 停靠面板拖放等需同时读 x/y 的手势）──
+
+/// 一次二维拖拽会话：`on_move` 逐次收到全局指针，`on_end` 在抬起时收到**最终**全局指针。
+///
+/// `on_end` 是 Docking 之类「拖到哪就放到哪」手势的提交点：没有它，控件只能知道
+/// 拖拽经过的位置，无法在释放那一刻结算放置目标。
+struct Drag2D {
+    on_move: Box<dyn FnMut(f32, f32)>,
+    on_end: Option<Box<dyn FnOnce(f32, f32)>>,
+    on_cancel: Option<Box<dyn FnOnce()>>,
+}
+
 thread_local! {
-    /// 活动二维拖拽回调（全局唯一）：`on_move(全局 x, 全局 y)`。
-    static DRAG_2D: RefCell<Option<Box<dyn FnMut(f32, f32)>>> = const { RefCell::new(None) };
+    /// 活动二维拖拽会话（全局唯一）。
+    static DRAG_2D: RefCell<Option<Drag2D>> = const { RefCell::new(None) };
 }
 
 /// 开始一次二维拖拽（按下时调用）：`on_move` 在指针移动阶段收到全局 `(x, y)`。
 /// 与一维比例会话互斥使用（同一时刻只跑一个手势）。
 pub fn begin_drag_2d(on_move: impl FnMut(f32, f32) + 'static) {
-    DRAG_2D.with(|d| *d.borrow_mut() = Some(Box::new(on_move)));
+    DRAG_2D.with(|d| {
+        *d.borrow_mut() = Some(Drag2D {
+            on_move: Box::new(on_move),
+            on_end: None,
+            on_cancel: None,
+        })
+    });
+}
+
+/// 带释放回调的二维拖拽：`on_end` 在指针抬起时收到最终全局 `(x, y)`。
+///
+/// 回调同样在 runtime 借用之外执行（take-put），其内部可以安全地写 `MutableState`。
+pub fn begin_drag_2d_with_end(
+    on_move: impl FnMut(f32, f32) + 'static,
+    on_end: impl FnOnce(f32, f32) + 'static,
+) {
+    begin_drag_2d_full(on_move, on_end, || {});
+}
+
+/// 带释放 + 取消回调的二维拖拽：`on_cancel` 在 [`drag_2d_cancel_global`]（如 Esc）时调用，
+/// **不**调用 `on_end`（取消 ≠ 提交）。用于「Esc 恢复拖拽前状态」的手势。
+pub fn begin_drag_2d_full(
+    on_move: impl FnMut(f32, f32) + 'static,
+    on_end: impl FnOnce(f32, f32) + 'static,
+    on_cancel: impl FnOnce() + 'static,
+) {
+    DRAG_2D.with(|d| {
+        *d.borrow_mut() = Some(Drag2D {
+            on_move: Box::new(on_move),
+            on_end: Some(Box::new(on_end)),
+            on_cancel: Some(Box::new(on_cancel)),
+        })
+    });
+}
+
+/// 取消活动二维拖拽（Esc 等）：调用 `on_cancel` 并丢弃会话，**不**提交 `on_end`。
+/// 返回之前是否有活动会话。
+pub fn drag_2d_cancel_global() -> bool {
+    let sess = DRAG_2D.with(|d| d.borrow_mut().take());
+    let Some(s) = sess else {
+        return false;
+    };
+    if let Some(f) = s.on_cancel {
+        f();
+    }
+    true
 }
 
 /// 指针移动时驱动二维拖拽；返回是否消费了本次移动。
 pub fn drag_2d_move_global(x: f32, y: f32) -> bool {
-    DRAG_2D.with(|d| {
-        if let Some(cb) = d.borrow_mut().as_mut() {
-            cb(x, y);
-            true
-        } else {
-            false
-        }
-    })
+    // take-put：回调可能间接触及 runtime / 再次发起拖拽，不能持有 RefCell 借用。
+    let mut sess = DRAG_2D.with(|d| d.borrow_mut().take());
+    let Some(s) = sess.as_mut() else {
+        return false;
+    };
+    (s.on_move)(x, y);
+    DRAG_2D.with(|d| *d.borrow_mut() = sess);
+    true
 }
 
 /// 指针抬起结束二维拖拽；返回之前是否有活动会话。
 pub fn drag_2d_end_global() -> bool {
-    DRAG_2D.with(|d| d.borrow_mut().take().is_some())
+    let (gx, gy) = last_pointer_global();
+    let mut sess = DRAG_2D.with(|d| d.borrow_mut().take());
+    let Some(s) = sess.as_mut() else {
+        return false;
+    };
+    if let Some(f) = s.on_end.take() {
+        f(gx, gy);
+    }
+    true
 }
 
 // ══════════════════════ 下拉刷新手势（pull-to-refresh） ══════════════════════
@@ -3553,6 +4141,29 @@ pub fn dispatch_secondary_click(target: NodeId) -> bool {
     dispatch_secondary_click_at(target, 0.0, 0.0)
 }
 
+/// 中间按钮（鼠标中键）分发：沿祖先链找最近 `on_middle_click`，take-put 调用。
+/// 不改变焦点、不产生波纹（中键语义独立于左键点击链，如 VS 中键关闭标签）。
+pub fn dispatch_middle_click_at(target: NodeId) -> bool {
+    let handler = crate::runtime::with_rt_pub(|rt| {
+        let mut cur = Some(target);
+        while let Some(id) = cur {
+            if let Some(f) = rt.nodes[id.index()].on_middle_click.take() {
+                return Some((id, f));
+            }
+            cur = rt.nodes[id.index()].parent;
+        }
+        None
+    });
+    match handler {
+        Some((id, mut f)) => {
+            f();
+            crate::runtime::with_rt_pub(|rt| rt.nodes[id.index()].on_middle_click = Some(f));
+            true
+        }
+        None => false,
+    }
+}
+
 // ══════════════ 按压指示（Flutter `InkWell` 语义：按下起波纹、抬起结算点击） ══════════════
 
 /// 波纹线速度（px/秒）：M3 波纹按固定线速度从按压点向外生长，不按容器尺寸归一。
@@ -3629,6 +4240,8 @@ fn invalidate_self_and_ancestors(rt: &mut Rt, idx: usize) {
 /// **不**触发 `on_click` —— 与 Flutter/Compose 一致，点击在抬起时结算。
 /// 返回是否命中了可点击链。
 pub fn dispatch_press_down(target: NodeId, gx: f32, gy: f32) -> bool {
+    // pointerInput 手势检测器优先接收（对齐 Compose pointerInput 与 clickable 共存）。
+    let pointer_consumed = crate::gesture::dispatch_pointer_event(target, crate::gesture::PointerEvent::press(gx, gy));
     let now = press_now_ns();
     let (hit, handler) = crate::runtime::with_rt_pub(|rt| {
         // 上一次按压的抬起事件可能整个丢了（在窗外释放 / 平台没投递）：
@@ -3639,7 +4252,7 @@ pub fn dispatch_press_down(target: NodeId, gx: f32, gy: f32) -> bool {
             }
         }
         let Some(idx) = nearest_click_idx(rt, target) else {
-            return (false, None);
+            return (pointer_consumed, None);
         };
         let click_rect = abs_rect(rt, NodeId(idx as u32));
         let ripple_node = if rt.nodes[idx].modifier.ripples_off() {
@@ -3673,7 +4286,7 @@ pub fn dispatch_press_down(target: NodeId, gx: f32, gy: f32) -> bool {
         (true, rt.nodes[idx].on_press.take())
     });
     if !hit {
-        return false;
+        return pointer_consumed;
     }
     let Some(mut f) = handler else {
         return true;
@@ -3690,6 +4303,18 @@ pub fn dispatch_press_down(target: NodeId, gx: f32, gy: f32) -> bool {
 /// 指针抬起：结束按压。位移在 [`TAP_SLOP`] 内且抬起链上的可点击节点与按下时同一个，
 /// 才触发 `on_click`（对齐 Flutter `onTap`）。返回是否触发了点击。
 pub fn dispatch_press_up(hit: Option<(NodeId, f32, f32)>, gx: f32, gy: f32) -> bool {
+    if let Some((target, _, _)) = hit {
+        // 检测器内部保存自己的按下起点；dx/dy 仅作辅助字段。
+        let e = crate::gesture::PointerEvent {
+            kind: crate::gesture::PointerEventType::Release,
+            x: gx,
+            y: gy,
+            dx: 0.0,
+            dy: 0.0,
+            time_ns: crate::gesture::now_nanos(),
+        };
+        crate::gesture::dispatch_pointer_event(target, e);
+    }
     let now = press_now_ns();
     let to_click = crate::runtime::with_rt_pub(|rt| {
         let Some(p) = rt.press.take() else { return None };
@@ -3883,6 +4508,26 @@ fn ripple_shape(mods: &Modifier) -> f32 {
     bg.max(clip)
 }
 
+/// 程序化滚动增量（标签条溢出箭头等）：布局期自动钳制到内容范围。
+pub fn scroll_by(id: NodeId, delta: f32) {
+    crate::runtime::with_rt_pub(|rt| {
+        if let Some(s) = rt.nodes[id.index()].scroll.as_mut() {
+            s.offset += delta;
+        }
+        mark_dirty_path(rt, id);
+    });
+}
+
+/// 滚动度量 `(offset, content_size, viewport)`，供溢出箭头判定可用性。
+pub fn scroll_metrics(id: NodeId) -> Option<(f32, f32, f32)> {
+    crate::runtime::with_rt_pub(|rt| {
+        let n = &rt.nodes[id.index()];
+        n.scroll
+            .as_ref()
+            .map(|s| (s.offset, s.content_size, if s.vertical { n.height } else { n.width }))
+    })
+}
+
 /// 滚轮分发：找目标链上第一个滚动容器。
 pub fn dispatch_scroll(target: Option<NodeId>, dy: f32) -> bool {
     crate::runtime::with_rt_pub(|rt| {
@@ -3907,18 +4552,54 @@ pub fn dispatch_scroll(target: Option<NodeId>, dy: f32) -> bool {
 }
 
 thread_local! {
-    /// 视口尺寸（平台每帧注入，浮层居中等场景需要绝对定位信息）。
-    static VIEWPORT: Cell<(f32, f32)> = const { Cell::new((800.0, 600.0)) };
+    /// 各组合根的视口尺寸（多窗口：每个窗口一个根，各自独立视口）。
+    static VIEWPORTS: RefCell<HashMap<NodeId, (f32, f32)>> = RefCell::new(HashMap::new());
+    /// 未指定根时的兜底视口（单根宿主 / 无头测试的 `set_viewport` 走这里）。
+    static DEFAULT_VIEWPORT: Cell<(f32, f32)> = const { Cell::new((800.0, 600.0)) };
+    /// 当前正在组合 / 布局的根（`viewport_size` 据此选根对应的视口）。
+    static CURRENT_ROOT: Cell<Option<NodeId>> = const { Cell::new(None) };
 }
 
-/// 注入视口尺寸（平台后端在布局前调用）。
+/// 注入视口尺寸（单窗口平台后端 / 测试调用）：同时作为默认视口与当前根的视口。
 pub fn set_viewport(width: f32, height: f32) {
-    VIEWPORT.with(|v| v.set((width, height)));
+    DEFAULT_VIEWPORT.with(|v| v.set((width, height)));
+    if let Some(root) = current_root() {
+        set_viewport_for(root, width, height);
+    }
 }
 
-/// 当前视口尺寸（组合期定位浮层用）。
+/// 给指定组合根注入视口尺寸（多窗口宿主在布局各自窗口前调用）。
+pub fn set_viewport_for(root: NodeId, width: f32, height: f32) {
+    VIEWPORTS.with(|m| {
+        m.borrow_mut().insert(root, (width, height));
+    });
+}
+
+/// 组合根销毁时清理其视口记录。
+pub fn clear_viewport(root: NodeId) {
+    VIEWPORTS.with(|m| {
+        m.borrow_mut().remove(&root);
+    });
+}
+
+/// 当前正在组合 / 布局的根（多窗口宿主切换窗口时更新）。
+pub fn current_root() -> Option<NodeId> {
+    CURRENT_ROOT.with(|c| c.get())
+}
+
+/// 设置当前根（保存/恢复由调用方负责）。
+pub fn set_current_root(root: Option<NodeId>) {
+    CURRENT_ROOT.with(|c| c.set(root));
+}
+
+/// 当前视口尺寸（组合期定位浮层用）：优先当前根自己的视口，否则用默认视口。
 pub fn viewport_size() -> (f32, f32) {
-    VIEWPORT.with(|v| v.get())
+    if let Some(root) = current_root() {
+        if let Some(size) = VIEWPORTS.with(|m| m.borrow().get(&root).copied()) {
+            return size;
+        }
+    }
+    DEFAULT_VIEWPORT.with(|v| v.get())
 }
 
 /// 更新滚动内容尺寸（测量后由容器自记）。
@@ -4153,33 +4834,102 @@ pub fn dispatch_char(ch: char) -> bool {
 /// 与上一悬停节点不同则依次回调 left(true→false)/entered(false→true)。
 /// 处理器在 runtime 借用外执行（take-put 防重入）。
 pub fn dispatch_hover_at(target: NodeId) -> bool {
-    let new_hover = crate::runtime::with_rt_pub(|rt| {
+    // 嵌套悬停语义（对齐 Flutter MouseRegion）：进入旧区域的**子区域**不触发旧区域
+    // 的 leave——父区域只在指针真正离开其范围时才退出。否则工具条（外层 hoverable）
+    // 内含带 hover 态的按钮（内层 handler），指针移到按钮上就会误触工具条 leave。
+    let (new_hover, prev_was_ancestor) = crate::runtime::with_rt_pub(|rt| {
         let mut cur = Some(target);
+        let mut new = None;
         while let Some(id) = cur {
             if rt.nodes[id.index()].hover_handler.is_some() {
-                return Some(id.index());
+                new = Some(id.index());
+                break;
             }
             cur = rt.nodes[id.index()].parent;
         }
-        None
+        let prev = rt.hovered_node;
+        let anc = match prev {
+            Some(p) => {
+                let mut cur = Some(target);
+                let mut yes = false;
+                while let Some(id) = cur {
+                    if id.index() == p {
+                        yes = true;
+                        break;
+                    }
+                    cur = rt.nodes[id.index()].parent;
+                }
+                yes
+            }
+            None => false,
+        };
+        (new, anc)
     });
     let prev = crate::runtime::with_rt_pub(|rt| std::mem::replace(&mut rt.hovered_node, new_hover));
     if new_hover == prev {
         return false;
     }
-    // 先离开旧节点，再进入新节点（处理器在借用外执行）。
+    // 离开旧区域（处理器在借用外执行）：
+    // - prev 仍是新目标的祖先（指针只是移进了它的子区域）→ 保持 entered，不回调；
+    // - 否则沿 prev 的祖先链补发 leave：凡**不再是新目标祖先**的悬停区域都退出
+    //   （从子区域直接离开父区域时，父区域的 leave 也要补上，不能卡在 entered）。
     if let Some(p) = prev {
-        let h = crate::runtime::with_rt_pub(|rt| rt.nodes[p].hover_handler.take());
-        if let Some(mut f) = h {
-            f(false);
-            crate::runtime::with_rt_pub(|rt| rt.nodes[p].hover_handler = Some(f));
+        if !(prev_was_ancestor && new_hover.is_some()) {
+            let chain: Vec<usize> = crate::runtime::with_rt_pub(|rt| {
+                let mut out = Vec::new();
+                let mut cur = Some(NodeId(p as u32));
+                while let Some(id) = cur {
+                    if rt.nodes[id.index()].hover_handler.is_some() {
+                        out.push(id.index());
+                    }
+                    cur = rt.nodes[id.index()].parent;
+                }
+                out
+            });
+            for node in chain {
+                let still_inside = crate::runtime::with_rt_pub(|rt| {
+                    let mut cur = Some(target);
+                    let mut yes = false;
+                    while let Some(id) = cur {
+                        if id.index() == node {
+                            yes = true;
+                            break;
+                        }
+                        cur = rt.nodes[id.index()].parent;
+                    }
+                    yes
+                });
+                if still_inside {
+                    continue;
+                }
+                let h = crate::runtime::with_rt_pub(|rt| rt.nodes[node].hover_handler.take());
+                if let Some(mut f) = h {
+                    f(false);
+                    crate::runtime::with_rt_pub(|rt| rt.nodes[node].hover_handler = Some(f));
+                }
+            }
         }
     }
     if let Some(n) = new_hover {
-        let h = crate::runtime::with_rt_pub(|rt| rt.nodes[n].hover_handler.take());
-        if let Some(mut f) = h {
-            f(true);
-            crate::runtime::with_rt_pub(|rt| rt.nodes[n].hover_handler = Some(f));
+        // enter 链：外层先 enter、内层后 enter（对齐 MouseRegion 顺序；处理器幂等）。
+        let mut chain: Vec<usize> = crate::runtime::with_rt_pub(|rt| {
+            let mut out = Vec::new();
+            let mut cur = Some(NodeId(n as u32));
+            while let Some(id) = cur {
+                if rt.nodes[id.index()].hover_handler.is_some() {
+                    out.push(id.index());
+                }
+                cur = rt.nodes[id.index()].parent;
+            }
+            out
+        });
+        chain.reverse(); // 外层在前
+        for node in chain {
+            let h = crate::runtime::with_rt_pub(|rt| rt.nodes[node].hover_handler.take());
+            if let Some(mut f) = h {
+                f(true);
+                crate::runtime::with_rt_pub(|rt| rt.nodes[node].hover_handler = Some(f));
+            }
         }
     }
     true
@@ -4189,6 +4939,58 @@ pub fn dispatch_hover_at(target: NodeId) -> bool {
 pub fn layout(modifier: Modifier, policy: Box<dyn MeasurePolicy>, content: impl Fn() + 'static) {
     let id = add_node(Policy::Custom(policy), modifier);
     with_content_scope(id, content);
+}
+
+/// `SubcomposeLayout { measurable... }` — Compose `SubcomposeLayout` 对齐入口。
+///
+/// 与 [`layout`] 同构：measurePolicy 在 [`MeasureCtx::subcompose`] 中按 slot 声明子内容，
+/// 引擎在 measure 间隙组合并按 keyed 复用，下一轮测量得到子内容尺寸。
+/// `content` 是布局自身的固定内容（可为空）；实际按需子内容由 policy 的 measure 生成。
+pub fn SubcomposeLayout(
+    modifier: Modifier,
+    policy: Box<dyn MeasurePolicy>,
+    content: impl Fn() + 'static,
+) {
+    layout(modifier, policy, content)
+}
+
+/// 内置 SubcomposeLayout 常用策略：把所有子项竖向堆叠，宽度取最大、高度取总和。
+/// 子项由 policy 的 `ctx.subcompose(slot, content)` 按需声明。
+pub struct SubcomposeStackPolicy;
+
+impl MeasurePolicy for SubcomposeStackPolicy {
+    fn measure(
+        &mut self,
+        ctx: &mut MeasureCtx,
+        measurables: &[NodeId],
+        constraints: Constraints,
+    ) -> MeasureResult {
+        let mut placements = Vec::new();
+        let (mut w, mut h) = (0.0f32, 0.0f32);
+        let child_c = Constraints::new(
+            0.0,
+            constraints.max_width,
+            0.0,
+            Constraints::INFINITY,
+        );
+        for id in measurables {
+            let p = ctx.measure(*id, child_c);
+            w = w.max(p.width);
+            placements.push((*id, 0.0, h));
+            h += p.height;
+        }
+        let w = if constraints.max_width.is_finite() {
+            w.min(constraints.max_width).max(constraints.min_width)
+        } else {
+            w.max(constraints.min_width)
+        };
+        let h = if constraints.max_height.is_finite() {
+            h.min(constraints.max_height).max(constraints.min_height)
+        } else {
+            h.max(constraints.min_height)
+        };
+        MeasureResult { width: w, height: h, placements }
+    }
 }
 
 // Rect / Offset re-exports

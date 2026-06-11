@@ -204,29 +204,29 @@ fn list_row(index: usize, selected: MutableState<usize>, content: impl Fn() + 's
     id
 }
 
-/// `ListCustom(count, item_content, selected, modifier)` — Jetpack Compose 风格的可自定义列表。
+/// `ListCustom(count, selected, modifier, item_content)` — Jetpack Compose 风格的可自定义列表。
 ///
 /// 与 [`List`] 共用选中语义（`secondary_container` 高亮）与键盘步长，但每行内容由
 /// `item_content(index)` 绘制，调用方可放任意 widget（图标、副标题、自定义布局），
 /// 不再受 `String` 限制。例如：
 ///
 /// ```ignore
-/// ListCustom(items.len(), |i| {
+/// ListCustom(items.len(), sel, Modifier::new().fill_max_width(), |i| {
 ///     let it = &items[i];
 ///     Row(Modifier::new().fill_max_width(), Start, Center, move || {
 ///         icon(it.icon, 24.0, colors.on_surface_variant, Modifier::new());
 ///         Text(it.label, tokens::body_large(colors.on_surface), Modifier::new());
 ///     });
-/// }, sel, Modifier::new().fill_max_width());
+/// });
 /// ```
 ///
 /// 行外壳（整行点击选中 + 高亮）由 [`list_row`] 统一提供，故点击行内任意位置都归属同一行。
 /// 不带滚动容器：适合条目较少、由外层负责滚动的场景。
 pub fn ListCustom(
     count: usize,
-    item_content: impl Fn(usize) + 'static,
     selected: MutableState<usize>,
     modifier: Modifier,
+    item_content: impl Fn(usize) + 'static,
 ) {
     let n = count;
     // `item_content` 是 `Fn`（可多次 & 调用），但 `list_row` 的 content 参数要求 `'static`；
@@ -1446,16 +1446,16 @@ pub fn ListView(items: &[String], selected: MutableState<usize>, modifier: Modif
     );
 }
 
-/// `ListViewCustom(count, item_content, selected, modifier)` — 带滚动 + 自定义 item 的列表。
+/// `ListViewCustom(count, selected, modifier, item_content)` — 带滚动 + 自定义 item 的列表。
 ///
 /// 与 [`ListView`] 共用选中语义、键盘步长（↑/↓ ±1、PageUp/Down ±8、Home/End）与
 /// 滚动 sticky；每行内容由 `item_content(index)` 绘制，调用方可放任意 widget。行外壳
 /// （整行点击选中 + `secondary_container` 高亮）由 [`list_row`] 统一提供。
 pub fn ListViewCustom(
     count: usize,
-    item_content: impl Fn(usize) + 'static,
     selected: MutableState<usize>,
     modifier: Modifier,
+    item_content: impl Fn(usize) + 'static,
 ) {
     let n = count;
     let cur = selected.get();

@@ -6,16 +6,23 @@
 //! - `MutableState` — 可观察状态：读取注册读者，写入失效读者
 //! - `RecomposeScope` — 状态变更只重跑**读到该状态**的作用域（定向重组）
 //! - 子作用域按「父作用域内位置」复用（对齐 SlotTable 组身份语义），
-//!   `remember` 槽位跨重组存活
+//!   `remember` 槽位跨重组存活；每个作用域的槽存储为 [`crate::slot_table::SlotTable`]
+//!   gap-buffer（线性数组 + 可搬移空隙 + group 标记 + Anchor），插入/删除走 gap 复用
 //! - `CompositionLocal` — 沿作用域祖先链查找的隐式环境
 //! - `Recomposer` / `advance_frame` — 重组与帧调度
+//! - 节点树变更（插入/删除/移动/清空）统一经 [`crate::applier::NodeApplier`]，
+//!   对齐 Compose `Applier`；宿主可注入自定义实现
+//! - [`crate::snapshot`] 对齐 Compose `Snapshot`：隔离读 + 批量写 + apply 提交 +
+//!   read/write observer；默认无快照时状态读写行为不变
 
 use std::any::{Any, TypeId};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 
 use crate::foundation::Constraints;
 use crate::layout::{NodeId, NodeRef};
+use crate::slot_table::SlotTable;
 
 // ══════════════════════════════ 句柄 ══════════════════════════════
 
@@ -59,15 +66,21 @@ struct ObserverSlot {
 /// 协程任务（取消 = 置空 future，下次 drain 移除）。
 pub struct TaskSlot {
     fut: Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>>,
+    /// 归属作用域（Compose `LaunchedEffect` 随组合销毁取消；对齐 `rememberCoroutineScope`）。
+    pub(crate) owner: Option<ScopeId>,
 }
 
 pub(crate) struct ScopeData {
     /// 内容发射到的容器节点。
     pub(crate) node: Option<NodeId>,
-    /// remember 槽位（位置即身份，跨重组存活）。
-    pub(crate) slots: Vec<Box<dyn Any>>,
+    /// remember 槽位（位置即身份，跨重组存活）—— SlotTable gap-buffer（对齐 Compose）。
+    pub(crate) slots: SlotTable,
     /// 子作用域槽（父作用域内位置复用 — SlotTable 组身份）。
     pub(crate) child_scopes: Vec<ScopeId>,
+    /// 作用域键：由 `emit_keyed_scope` 指定。键变化时该子作用域整体重建
+    /// （remember 槽位与后代一并销毁），避免「同一位置渲染不同分支」时
+    /// 上一分支的同类型状态串到新分支（story 页面切换后 tab 读到越界值）。
+    pub(crate) key: Option<u64>,
     /// remember 槽位游标：每遇到一个 `remember`/`keyed_remember` 前进 1，
     /// 与 `slots` 严格 1:1（游标 == 该记忆在本作用域内出现的序号 == `slots` 下标）。
     run_cursor: usize,
@@ -115,8 +128,12 @@ pub struct RuntimeData {
     pub(crate) frame_drivers: HashMap<u64, FrameDriver>,
     /// 帧驱动自增 id 序号（用于 remove_frame_driver）。
     frame_driver_seq: u64,
-    /// 重组监听（状态变化 → 请求重绘）。
-    pub(crate) recompose_listeners: Vec<Box<dyn FnMut()>>,
+    /// 重组监听（状态变化 → 请求重绘），按 id 存放以便关窗时注销。
+    pub(crate) recompose_listeners: HashMap<u64, Box<dyn FnMut()>>,
+    /// 重组监听自增 id。
+    listener_seq: u64,
+    /// 每次成功重组后执行的副作用（Compose `SideEffect`），作用域销毁时丢弃。
+    pub(crate) post_recompose: Vec<(ScopeId, Box<dyn FnOnce()>)>,
     pub(crate) frame_delta: f32,
     pub(crate) frame: u64,
     /// 单调帧时钟（纳秒）— 对齐 Compose `MonotonicFrameClock`：动画按墙钟计时，
@@ -130,8 +147,9 @@ pub struct RuntimeData {
     pub(crate) press: Option<crate::layout::Press>,
     /// 在飞的波纹（按下期间生长、抬手后淡出）。
     pub(crate) ripples: Vec<crate::layout::Ripple>,
-    /// 上一帧 perform_layout 使用的约束（用于检测窗口尺寸变化 → 整体失效重布局）。
-    pub(crate) last_constraints: Option<Constraints>,
+    /// 上一帧 perform_layout 使用的约束（按根记录：多窗口各自尺寸独立，
+    /// 用于检测单个窗口尺寸变化 → 该根整体失效重布局）。
+    pub(crate) last_constraints: HashMap<crate::layout::NodeId, Constraints>,
 }
 
 thread_local! {
@@ -167,7 +185,9 @@ impl RuntimeData {
             disposable_stack: Vec::new(),
             frame_drivers: HashMap::new(),
             frame_driver_seq: 0,
-            recompose_listeners: Vec::new(),
+            recompose_listeners: HashMap::new(),
+            listener_seq: 0,
+            post_recompose: Vec::new(),
             frame_delta: 0.0,
             frame: 0,
             frame_time_nanos: 0.0,
@@ -175,7 +195,7 @@ impl RuntimeData {
             hovered_node: None,
             press: None,
             ripples: Vec::new(),
-            last_constraints: None,
+            last_constraints: HashMap::new(),
         }
     }
 }
@@ -192,6 +212,27 @@ pub fn with_rt_pub<R>(f: impl FnOnce(&mut RuntimeData) -> R) -> R {
 /// 公开 runtime 访问（测试 / 平台后端事件注入用）。
 pub fn with_runtime<R>(f: impl FnOnce(&mut RuntimeData) -> R) -> R {
     with_rt(f)
+}
+
+/// 主线程任务队列：后台线程（如文件对话框的阻塞 `rfd` 调用）把结果回调投递到这里，
+/// 由 `Kernel::frame` 在「运行时 `RefCell` 借用尚未建立」时排空，从而安全调用
+/// `MutableState::set` 等需 `with_rt` 的操作。等价于 rui `spawn_blocking` 后把结果
+/// 送回 GUI 线程——因为 `MutableState` 写入只能在主线程运行时里进行。
+static MAIN_TASKS: Mutex<Vec<Box<dyn FnOnce() + Send>>> = Mutex::new(Vec::new());
+
+/// 把一个任务投递到主线程（GUI 运行时线程）执行。供后台线程回传结果。
+pub fn post_to_main(f: impl FnOnce() + Send + 'static) {
+    MAIN_TASKS.lock().unwrap().push(Box::new(f));
+}
+
+/// 排空主线程任务队列。`Kernel::frame` 在重组前调用——此时运行时 `RefCell` 借用尚未建立，
+/// 任务内可安全再入 `with_rt`（如 `MutableState::set`）。
+pub fn drain_main_tasks() {
+    // 取出整个队列（留下空 Vec）并立即释放锁，避免持锁期间运行回调（回调内可能再次 post_to_main）。
+    let mut tasks = std::mem::take(&mut *MAIN_TASKS.lock().unwrap());
+    for t in tasks.drain(..) {
+        t();
+    }
 }
 
 /// 当前组合作用域（浮层注册 / 动画帧驱动注册用）。
@@ -310,6 +351,11 @@ impl<T: 'static + PartialEq> MutableState<T> {
     /// 同值写入不会触发重组，从根上消除「组合期写自己读的 state」类死循环。
     pub fn set(&self, value: T) {
         let key = self.key();
+        // 快照内写：只进隔离写集合，不立即全局生效/失效（apply 时统一提交）。
+        if crate::snapshot::in_snapshot() {
+            let _ = crate::snapshot::write_capture(key, Box::new(value));
+            return;
+        }
         with_rt(|rt| {
             let slot = &mut rt.states[key as usize];
             if (slot.eq)(slot.value.as_ref(), &value) {
@@ -327,6 +373,14 @@ impl<T: 'static + PartialEq> MutableState<T> {
         T: Clone,
     {
         let key = self.key();
+        if crate::snapshot::in_snapshot() {
+            // 快照内：基于快照视图读旧值，算新值后写入隔离集合。
+            let old = self.read_clone();
+            let mut new = old;
+            f(&mut new);
+            let _ = crate::snapshot::write_capture(key, Box::new(new));
+            return;
+        }
         with_rt(|rt| {
             let slot = &mut rt.states[key as usize];
             let old = slot.value.downcast_ref::<T>().unwrap().clone();
@@ -339,18 +393,23 @@ impl<T: 'static + PartialEq> MutableState<T> {
     }
 }
 
-impl<T: Copy> MutableState<T> {
+impl<T: Copy + 'static> MutableState<T> {
     /// 读并注册依赖（Compose `value` getter）。
     pub fn get(&self) -> T {
         register_read(self.key());
         let key = self.key();
-        with_rt(|rt| *rt.states[key as usize].value.downcast_ref::<T>().unwrap())
+        // 快照内读优先命中写集合/读缓存（对齐 Compose snapshot isolation）。
+        crate::snapshot::read_or(key, || {
+            with_rt(|rt| *rt.states[key as usize].value.downcast_ref::<T>().unwrap())
+        })
     }
 
     /// 读但不注册依赖（Compose `unreadValue`，绘制/事件读取用）。
     pub fn read_unregistered(&self) -> T {
         let key = self.key();
-        with_rt(|rt| *rt.states[key as usize].value.downcast_ref::<T>().unwrap())
+        crate::snapshot::read_or(key, || {
+            with_rt(|rt| *rt.states[key as usize].value.downcast_ref::<T>().unwrap())
+        })
     }
 }
 
@@ -358,12 +417,9 @@ impl<T: Clone + 'static> MutableState<T> {
     /// 读克隆（非 Copy 类型，注册依赖）。
     pub fn read_clone(&self) -> T {
         register_read(self.id.0);
-        with_rt(|rt| {
-            rt.states[self.id.0 as usize]
-                .value
-                .downcast_ref::<T>()
-                .unwrap()
-                .clone()
+        let key = self.id.0;
+        crate::snapshot::read_clone_or(key, || {
+            with_rt(|rt| rt.states[key as usize].value.downcast_ref::<T>().unwrap().clone())
         })
     }
 }
@@ -485,7 +541,7 @@ fn process_invalidations() {
 
 fn run_recompose_listeners() {
     let mut listeners = with_rt(|rt| std::mem::take(&mut rt.recompose_listeners));
-    for l in &mut listeners {
+    for l in listeners.values_mut() {
         l();
     }
     with_rt(|rt| rt.recompose_listeners = listeners);
@@ -527,6 +583,22 @@ pub fn state_id<T: 'static>(st: MutableState<T>) -> u32 {
     st.id.0
 }
 
+/// 提交快照的隔离写集合到全局状态并失效读者（对齐 Compose `MutableSnapshot.apply()`）。
+pub fn apply_snapshot(sid: crate::snapshot::SnapshotId) {
+    crate::snapshot::apply_with(sid, |key, value| {
+        with_rt(|rt| {
+            let slot = &mut rt.states[key as usize];
+            // 以快照捕获的值覆盖，并失效读者（写观察者由 snapshot::apply_with 通知）。
+            let changed = !(slot.eq)(slot.value.as_ref(), value.as_ref());
+            if changed {
+                slot.value = value;
+                invalidate_state(rt, key);
+            }
+        });
+    });
+    process_invalidations();
+}
+
 /// 调度作用域重组（幂等）。
 pub fn schedule_scope(sid: ScopeId) {
     with_rt(|rt| schedule_scope_rt(rt, sid));
@@ -547,8 +619,9 @@ fn alloc_scope() -> ScopeId {
         let sid = ScopeId(rt.scopes.len() as u32);
         rt.scopes.push(Some(ScopeData {
             node: None,
-            slots: Vec::new(),
+            slots: SlotTable::new(),
             child_scopes: Vec::new(),
+            key: None,
             run_cursor: 0,
             child_cursor: 0,
             content: None,
@@ -560,12 +633,49 @@ fn alloc_scope() -> ScopeId {
     })
 }
 
+/// 在指定父作用域下按 key 发射子组合（对齐 Compose `SubcomposeLayout.subcompose`）。
+///
+/// 临时把父 scope / 父节点压入栈，复用 `emit_keyed_scope` 的 keyed 作用域语义，
+/// 使同一 slot 的子内容跨轮复用 remember 状态。
+pub fn subcompose_scope(parent: ScopeId, key: u64, content: impl Fn() + 'static) -> ScopeId {
+    let node = with_rt(|rt| {
+        rt.scopes
+            .get(parent.0 as usize)
+            .and_then(|o| o.as_ref())
+            .and_then(|s| s.node)
+    });
+    with_rt(|rt| {
+        rt.scope_stack.push(parent);
+        if let Some(n) = node {
+            rt.parent_stack.push(n);
+        }
+    });
+    let sid = emit_keyed_scope(key, content);
+    with_rt(|rt| {
+        if node.is_some() {
+            rt.parent_stack.pop();
+        }
+        rt.scope_stack.pop();
+    });
+    sid
+}
+
 /// 发射重组作用域：内容作为 `content` 运行，其发射的 widget 挂到当前父节点。
 ///
 /// 子作用域按父作用域内位置复用（槽位语义），父重组时立即重跑。
 /// 父作用域从线程局部 `scope_stack` 读取（不再需要显式传入 `c`）。
 pub fn emit_scope(content: impl Fn() + 'static) -> ScopeId {
-    emit_scope_impl(None, None, content)
+    emit_scope_impl(None, None, None, content)
+}
+
+/// 按 key 发射子作用域：同一父作用域同一位置，key 相同则复用、key 变化则整体重建。
+///
+/// 用于「同一位置渲染不同分支/页面」时隔离状态：普通 `emit_scope` 只按位置复用，
+/// 分支 A 的 `remember { mutableStateOf(3) }` 会被分支 B 的 `remember { mutableStateOf(0) }`
+/// 原样继承（两者都是 `MutableState<usize>`，downcast 成功），使 B 读到越界值而 panic。
+/// 键控后 key 变化即清空该作用域的 remember 槽与后代，等价于 Compose `key(idx) { ... }`。
+pub fn emit_keyed_scope(key: u64, content: impl Fn() + 'static) -> ScopeId {
+    emit_scope_impl(None, None, Some(key), content)
 }
 
 /// 内容发射到指定容器节点（widget 容器实现用：Column/Row/box 的 content 作用域）。
@@ -573,33 +683,48 @@ pub(crate) fn emit_scope_into(
     node: crate::layout::NodeId,
     content: impl Fn() + 'static,
 ) -> ScopeId {
-    emit_scope_impl(None, Some(node), content)
+    emit_scope_impl(None, Some(node), None, content)
 }
 
 fn emit_scope_impl(
     seed_locals: Option<(TypeId, Box<dyn Any>)>,
     node_override: Option<crate::layout::NodeId>,
+    key: Option<u64>,
     content: impl Fn() + 'static,
 ) -> ScopeId {
     let parent = with_rt(|rt| rt.scope_stack.last().copied());
 
     let scope: ScopeId = match parent {
-        Some(p) => with_rt(|rt| {
+        Some(p) => {
             // 子作用域按自身游标 `child_cursor` 复用（与 `child_scopes` 严格 1:1），
             // 不得与 remember 的 `run_cursor` 混用（否则交替出现时位置失配）。
-            let cursor = rt.scopes[p.0 as usize].as_ref().unwrap().child_cursor;
-            rt.scopes[p.0 as usize].as_mut().unwrap().child_cursor += 1;
-            let reuse = {
-                let cs = &rt.scopes[p.0 as usize].as_ref().unwrap().child_scopes;
-                cs.get(cursor).copied().filter(|s| {
+            let (cursor, existing, reuse) = with_rt(|rt| {
+                let cursor = rt.scopes[p.0 as usize].as_ref().unwrap().child_cursor;
+                rt.scopes[p.0 as usize].as_mut().unwrap().child_cursor += 1;
+                let existing = rt.scopes[p.0 as usize]
+                    .as_ref()
+                    .unwrap()
+                    .child_scopes
+                    .get(cursor)
+                    .copied();
+                let reuse = existing.filter(|s| {
                     rt.scopes
                         .get(s.0 as usize)
                         .and_then(|o| o.as_ref())
-                        .map(|sd| !sd.disposed)
+                        .map(|sd| !sd.disposed && sd.key == key)
                         .unwrap_or(false)
-                })
-            };
-            match reuse {
+                });
+                (cursor, existing, reuse)
+            });
+            // key 变化（或首次发射）：先销毁旧作用域及其 remember 槽/后代，
+            // 避免上一分支的同类型状态被新分支按位置继承。
+            if reuse.is_none() {
+                if let Some(old) = existing {
+                    with_rt(|rt| dispose_scope_rt(rt, old));
+                    drain_disposal_queue();
+                }
+            }
+            with_rt(|rt| match reuse {
                 Some(s) => {
                     rt.scopes[s.0 as usize].as_mut().unwrap().content = Some(Box::new(content));
                     s
@@ -608,8 +733,9 @@ fn emit_scope_impl(
                     let sid = ScopeId(rt.scopes.len() as u32);
                     rt.scopes.push(Some(ScopeData {
                         node: None,
-                        slots: Vec::new(),
+                        slots: SlotTable::new(),
                         child_scopes: Vec::new(),
+                        key,
                         run_cursor: 0,
                         child_cursor: 0,
                         content: Some(Box::new(content)),
@@ -625,8 +751,8 @@ fn emit_scope_impl(
                     }
                     sid
                 }
-            }
-        }),
+            })
+        }
         None => {
             let sid = alloc_scope();
             with_rt(|rt| {
@@ -696,7 +822,8 @@ fn run_scope(sid: ScopeId) {
             // 节点身份不跨重组：旧子树只摘不立即回收 —— 作用域树与节点树可能错位
             // （某个活作用域的节点仍挂在别处），直接释放会误伤活节点。统一交给 GC：
             // 从根做可达性扫描，回收真正无人引用的节点（见 `collect_node_garbage`）。
-            let _ = std::mem::take(&mut rt.nodes[n.index()].children);
+            // 对齐 Compose Applier.clear：重组前摘除整个子树（旧节点交 GC）。
+            crate::applier::apply(|ap, rt| ap.clear(rt, n), rt);
             rt.node_gc_pending = true;
             // 增量渲染：作用域重组 → 整个子树（含内联子节点，其 draw 闭包被重跑更新）
             // 标记脏；同时标记祖先，保证布局遍历不会因祖先被跳过而漏掉本子树。
@@ -713,19 +840,24 @@ fn run_scope(sid: ScopeId) {
     if let Some(content) = content {
         // 祖先链缓冲跨调用复用：state 动画每帧都会定向重组作用域，逐个分配 `Vec` 没必要。
         let mut chain = SCOPE_CHAIN.with(|c| std::mem::take(&mut *c.borrow_mut()));
-        let extra_ancestors = with_rt(|rt| {
+        let (extra_ancestors, scope_root) = with_rt(|rt| {
             // 定向重组时祖先作用域不在栈上——从节点父链重建（CompositionLocal 沿祖先链查找）。
             // emit 路径中祖先已在栈上，跳过重复压入。
             let mut extra = 0usize;
+            // 本作用域所属组合根（多窗口：同一 arena 内有多个互不相交的根）。
+            let mut root = None;
             if let Some(n) = node {
                 chain.clear();
+                let mut top = n;
                 let mut cur = rt.nodes[n.index()].parent;
                 while let Some(p) = cur {
                     if let Some(owner) = rt.nodes[p.index()].owner_scope {
                         chain.push(owner);
                     }
+                    top = p;
                     cur = rt.nodes[p.index()].parent;
                 }
+                root = Some(top);
                 // 收集顺序是 leaf→root，压栈需要 root→leaf。
                 for s in chain.iter().rev() {
                     if !rt.scope_stack.contains(s) {
@@ -741,9 +873,17 @@ fn run_scope(sid: ScopeId) {
             }
             // disposables 帧栈：本作用域内容注册的清理器归属本作用域
             rt.disposable_stack.push(Vec::new());
-            extra
+            (extra, root)
         });
+        // 组合期的“当前根”：`viewport_size` 据此取该窗口的视口（多窗口隔离）。
+        let prev_root = crate::layout::current_root();
+        if scope_root.is_some() {
+            crate::layout::set_current_root(scope_root);
+        }
         content();
+        if scope_root.is_some() {
+            crate::layout::set_current_root(prev_root);
+        }
         with_rt(|rt| {
             rt.parent_stack.pop();
             rt.read_stack.pop();
@@ -801,11 +941,23 @@ pub(crate) fn dispose_scope_rt(rt: &mut RuntimeData, sid: ScopeId) {
     // 挂在本作用域节点上的帧驱动一并注销 —— 对齐 Compose「组合取消即取消 withFrameNanos」。
     if let Some(n) = s.node.take() {
         if let Some(p) = rt.nodes[n.index()].parent {
-            rt.nodes[p.index()].children.retain(|c| *c != n);
+            // 对齐 Compose Applier.remove：从父节点摘除（默认实现等价原 retain）。
+            let pos = rt.nodes[p.index()].children.iter().position(|c| *c == n);
+            if let Some(i) = pos {
+                crate::applier::apply(|ap, rt| ap.remove(rt, p, i, 1), rt);
+            }
         }
         rt.node_gc_pending = true;
     }
     rt.frame_drivers.retain(|_, d| d.owner != Some(sid));
+    // 对齐 Compose：LaunchedEffect / rememberCoroutineScope 的协程随组合销毁取消。
+    for t in rt.tasks.iter_mut().flatten() {
+        if t.owner == Some(sid) {
+            t.fut = None;
+        }
+    }
+    // 未执行的 SideEffect 随作用域丢弃（对齐 Compose：取消的组合不执行副作用）。
+    rt.post_recompose.retain(|(owner, _)| *owner != sid);
     unsubscribe_scope(rt, sid);
     rt.scopes[sid.0 as usize] = None;
     rt.disposal_queue.extend(disposables);
@@ -828,12 +980,10 @@ pub fn remember<T: Clone + 'static>(init: impl FnOnce() -> T) -> T {
     let cursor = alloc_slot(sid);
     // 短借查槽；init 在借用外执行（init 可能再入 runtime，如 mutableStateOf）
     let existing: Option<T> = with_rt(|rt| {
-        let s = rt.scopes[sid.0 as usize].as_mut().unwrap();
-        if cursor < s.slots.len() {
-            s.slots[cursor].downcast_ref::<T>().map(|v| v.clone())
-        } else {
-            None
-        }
+        let s = rt.scopes[sid.0 as usize].as_ref().unwrap();
+        s.slots
+            .get_data(cursor)
+            .and_then(|b| b.downcast_ref::<T>().cloned())
     });
     match existing {
         Some(v) => v,
@@ -841,11 +991,7 @@ pub fn remember<T: Clone + 'static>(init: impl FnOnce() -> T) -> T {
             let v = init();
             with_rt(|rt| {
                 let s = rt.scopes[sid.0 as usize].as_mut().unwrap();
-                if cursor < s.slots.len() {
-                    s.slots[cursor] = Box::new(v.clone());
-                } else {
-                    s.slots.push(Box::new(v.clone()));
-                }
+                s.slots.set_data(cursor, Box::new(v.clone()));
             });
             v
         }
@@ -862,16 +1008,17 @@ pub fn keyed_remember<T: Clone + 'static>(key: u64, init: impl FnOnce() -> T) ->
         KeyChange,
     }
     let probe: Slot<T> = with_rt(|rt| {
-        let s = rt.scopes[sid.0 as usize].as_mut().unwrap();
-        if cursor < s.slots.len() {
-            if let Some((k, v)) = s.slots[cursor].downcast_ref::<(u64, T)>() {
-                if *k == key {
-                    return Slot::Hit(v.clone());
+        let s = rt.scopes[sid.0 as usize].as_ref().unwrap();
+        match s.slots.get_data(cursor) {
+            Some(b) => {
+                if let Some((k, v)) = b.downcast_ref::<(u64, T)>() {
+                    if *k == key {
+                        return Slot::Hit(v.clone());
+                    }
                 }
+                Slot::KeyChange
             }
-            Slot::KeyChange
-        } else {
-            Slot::Miss
+            None => Slot::Miss,
         }
     });
     match probe {
@@ -880,12 +1027,7 @@ pub fn keyed_remember<T: Clone + 'static>(key: u64, init: impl FnOnce() -> T) ->
             let v = init();
             with_rt(|rt| {
                 let s = rt.scopes[sid.0 as usize].as_mut().unwrap();
-                let entry = Box::new((key, v.clone()));
-                if cursor < s.slots.len() {
-                    s.slots[cursor] = entry;
-                } else {
-                    s.slots.push(entry);
-                }
+                s.slots.set_data(cursor, Box::new((key, v.clone())));
             });
             v
         }
@@ -908,9 +1050,35 @@ fn alloc_slot(sid: ScopeId) -> usize {
 /// 重组调度器 — Compose `Recomposer`。
 pub struct Recomposer;
 
+/// 重组监听句柄（[`Recomposer::on_recompose`] 返回，关窗时注销）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RecomposeListener(u64);
+
 impl Recomposer {
     pub fn has_pending() -> bool {
         with_rt(|rt| !rt.pending.is_empty())
+    }
+
+    /// 指定组合根是否有待重组作用域。
+    ///
+    /// 多窗口宿主按窗口注册重组监听：只有受影响的窗口才需要请求重绘，
+    /// 其余窗口保持休眠（与「静止即空闲」的性能约定一致）。
+    pub fn pending_for_root(root: crate::layout::NodeId) -> bool {
+        with_rt(|rt| {
+            rt.pending.iter().any(|&sid| {
+                let node = rt
+                    .scopes
+                    .get(sid.0 as usize)
+                    .and_then(|s| s.as_ref())
+                    .and_then(|s| s.node);
+                let Some(node) = node else { return false };
+                let mut cur = node;
+                while let Some(p) = rt.nodes[cur.index()].parent {
+                    cur = p;
+                }
+                cur == root
+            })
+        })
     }
 
     /// 运行全部待重组作用域（一帧的 composition pass）。
@@ -952,6 +1120,8 @@ impl Recomposer {
                     run_scope(sid);
                 }
             }
+            // Compose `SideEffect`：本批所有作用域成功重组后执行副作用（借用外）。
+            drain_post_recompose();
             // 本轮重组中新调度的作用域接回同一块缓冲，下一轮（下一帧）继续复用其容量。
             with_rt(|rt| {
                 let fresh = std::mem::take(&mut rt.pending);
@@ -962,9 +1132,23 @@ impl Recomposer {
         }
     }
 
-    /// 注册重组监听（状态变化 → 请求重绘/帧调度）。
-    pub fn on_recompose(listener: impl FnMut() + 'static) {
-        with_rt(|rt| rt.recompose_listeners.push(Box::new(listener)));
+    /// 注册重组监听（状态变化 → 请求重绘/帧调度）。返回句柄，关窗时用
+    /// [`Recomposer::off_recompose`] 注销（否则多窗口反复开关会累积监听）。
+    pub fn on_recompose(listener: impl FnMut() + 'static) -> RecomposeListener {
+        let id = with_rt(|rt| {
+            let id = rt.listener_seq;
+            rt.listener_seq += 1;
+            rt.recompose_listeners.insert(id, Box::new(listener));
+            id
+        });
+        RecomposeListener(id)
+    }
+
+    /// 注销重组监听。
+    pub fn off_recompose(handle: RecomposeListener) {
+        with_rt(|rt| {
+            rt.recompose_listeners.remove(&handle.0);
+        });
     }
 }
 
@@ -1085,6 +1269,18 @@ pub fn scope_alive(sid: ScopeId) -> bool {
     with_rt(|rt| owner_alive_in(rt, sid))
 }
 
+/// 作用域所属的组合根（多窗口：动画注册表据此只给「有动画的窗口」续帧）。
+pub fn scope_root(sid: ScopeId) -> Option<crate::layout::NodeId> {
+    with_rt(|rt| {
+        let node = rt.scopes.get(sid.0 as usize)?.as_ref()?.node?;
+        let mut cur = node;
+        while let Some(p) = rt.nodes[cur.index()].parent {
+            cur = p;
+        }
+        Some(cur)
+    })
+}
+
 fn owner_alive_in(rt: &RuntimeData, sid: ScopeId) -> bool {
     rt.scopes
         .get(sid.0 as usize)
@@ -1108,10 +1304,12 @@ pub async fn delay_frames(n: u64) {
 
 /// 生成协程任务，返回句柄（可取消）。
 pub fn spawn_task(future: impl std::future::Future<Output = ()> + 'static) -> TaskId {
+    let owner = current_scope_id(); // 借用外取，避免与下面 with_rt 嵌套借用
     with_rt(|rt| {
         let id = TaskId(rt.tasks.len() as u32);
         rt.tasks.push(Some(TaskSlot {
             fut: Some(Box::pin(future)),
+            owner,
         }));
         id
     })
@@ -1154,7 +1352,7 @@ pub fn drain_tasks() {
         if batch.is_empty() {
             return;
         }
-        let waker = noop_waker();
+        let waker = main_waker();
         let mut cx = std::task::Context::from_waker(&waker);
         let mut leftovers = Vec::new();
         let mut progressed = false;
@@ -1182,15 +1380,25 @@ pub fn drain_tasks() {
     }
 }
 
-fn noop_waker() -> std::task::Waker {
-    use std::task::{RawWaker, RawWakerVTable, Waker};
-    fn clone(_: *const ()) -> RawWaker {
-        RawWaker::new(std::ptr::null(), &VTABLE)
+/// 任务 waker：外部执行器线程（tokio / async-std / 自管线程）唤醒 Future 时，
+/// 经跨线程投递通道把「需要续帧」投回主线程，宿主随后 poll 任务。
+///
+/// 仅 Waker 本身用 `Arc`（标准库 `Wake` 要求）——节点/状态/作用域仍全部 arena 化，
+/// 不共享；这里不引入任何 unsafe（替代原 noop waker 的 RawWaker 写法）。
+struct MainWake;
+
+impl std::task::Wake for MainWake {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
     }
-    fn noop(_: *const ()) {}
-    static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
-    // 唯一的 unsafe：标准库 Waker::from_raw 惯用法（vtable 全 noop，无内存操作）
-    unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        post_to_main(|| crate::animation::request_anim_frames());
+    }
+}
+
+fn main_waker() -> std::task::Waker {
+    std::task::Waker::from(Arc::new(MainWake))
 }
 
 // ══════════════════════════════ CompositionLocal ══════════════════════════════
@@ -1217,7 +1425,7 @@ impl<T: 'static> CompositionLocal<T> {
 impl<T: Clone + 'static> CompositionLocal<T> {
     /// 提供值并组合内容（Compose `LocalX provides value { .. }`）。
     pub fn provides(&self, value: T, content: impl Fn() + 'static) {
-        emit_scope_impl(Some((TypeId::of::<T>(), Box::new(value))), None, content);
+        emit_scope_impl(Some((TypeId::of::<T>(), Box::new(value))), None, None, content);
     }
 
     /// 同 [`Self::provides`]，但内容作用域直接挂到既有容器节点（省掉透传组节点）。
@@ -1232,6 +1440,7 @@ impl<T: Clone + 'static> CompositionLocal<T> {
         emit_scope_impl(
             Some((TypeId::of::<T>(), Box::new(value))),
             Some(node),
+            None,
             content,
         );
     }
@@ -1260,9 +1469,69 @@ impl<T: Clone + 'static> CompositionLocal<T> {
 
 // ══════════════════════════════ Effects ══════════════════════════════
 
-/// `SideEffect { block }` — 组合期间立即执行。
+/// `SideEffect { block }` — 组合期间立即执行（保留兼容旧调用）。
 pub fn side_effect(_c: &mut Composer, block: impl FnOnce()) {
     block();
+}
+
+/// `SideEffect { ... }` — Jetpack Compose 语义：每次**成功重组后**执行副作用。
+///
+/// 与旧 `side_effect` 不同：block 在 content() 完成、作用域栈复原之后才执行，
+/// 由 `Recomposer::recompose_pending` 在每轮 run_scope 之后 drain；未执行的副作用
+/// 随作用域销毁丢弃（组合取消不执行副作用）。
+pub fn SideEffect(block: impl FnOnce() + 'static) {
+    let sid = current_scope_id().expect("SideEffect outside composition scope");
+    with_rt(|rt| rt.post_recompose.push((sid, Box::new(block))));
+}
+
+/// drain 本轮所有 post-recompose 副作用（借用外执行，允许回调重入 runtime）。
+pub(crate) fn drain_post_recompose() {
+    let effects: Vec<(ScopeId, Box<dyn FnOnce()>)> =
+        with_rt(|rt| std::mem::take(&mut rt.post_recompose));
+    for (owner, f) in effects {
+        // 双重保险：执行前再确认作用域仍存活（drain 期间可能被前一个 effect 销毁）。
+        let alive = with_rt(|rt| {
+            rt.scopes
+                .get(owner.0 as usize)
+                .and_then(|o| o.as_ref())
+                .map(|s| !s.disposed)
+                .unwrap_or(false)
+        });
+        if alive {
+            f();
+        }
+    }
+}
+
+/// `snapshotFlow { calc }` — 对齐 Compose `snapshotFlow`：把快照中读取的状态
+/// 转换为「值变化才发射」的派生值。本工程无 Kotlin Flow，返回承载最新值的 `State<T>`，
+/// 读取它即可获得流的最新发射（eq 去重由 `derivedStateOf` 保证）。
+pub fn snapshotFlow<T: Clone + PartialEq + 'static>(calc: impl FnMut() -> T + 'static) -> State<T> {
+    derivedStateOf(calc)
+}
+
+/// `producedState(initial) { producer }` — 对齐 Compose `produceState`：
+/// 在组合作用域内启动协程，协程向返回的 State 写入结果；key 变化时取消旧生产者。
+pub fn producedState<T, F>(
+    initial: T,
+    key: u64,
+    producer: impl FnOnce(MutableState<T>) -> F + 'static,
+) -> State<T>
+where
+    T: Clone + PartialEq + 'static,
+    F: std::future::Future<Output = ()> + 'static,
+{
+    let state = remember(|| mutableStateOf(initial));
+    launched_effect(key, producer(state));
+    state
+}
+
+/// `rememberUpdatedState(value)` — 记住最新值但不建立依赖（对齐 Compose）。
+/// 常用于 LaunchedEffect 中读取最新 lambda/值而不重启协程。
+pub fn rememberUpdatedState<T: Clone + PartialEq + 'static>(value: T) -> MutableState<T> {
+    let state = remember(|| mutableStateOf(value.clone()));
+    state.peek_mut(|v| *v = value);
+    state
 }
 
 /// `LaunchedEffect(key) { block }` — key 变化时取消旧协程、启动新协程。
@@ -1270,28 +1539,31 @@ pub fn launched_effect(key: u64, block: impl std::future::Future<Output = ()> + 
     let sid = current_scope_id().expect("launched_effect outside scope");
     let cursor = alloc_slot(sid);
     with_rt(|rt| {
-        let s = rt.scopes[sid.0 as usize].as_mut().unwrap();
-        if cursor < s.slots.len() {
-            if let Some((k, old)) = s.slots[cursor].downcast_ref::<(u64, TaskId)>() {
-                if *k == key {
-                    return;
-                }
-                let old = *old;
-                if let Some(slot) = rt.tasks.get_mut(old.0 as usize).and_then(|t| t.as_mut()) {
-                    slot.fut = None;
-                }
+        let existing = rt.scopes[sid.0 as usize]
+            .as_ref()
+            .unwrap()
+            .slots
+            .get_data(cursor)
+            .and_then(|b| b.downcast_ref::<(u64, TaskId)>())
+            .copied();
+        if let Some((k, old)) = existing {
+            if k == key {
+                return;
+            }
+            if let Some(slot) = rt.tasks.get_mut(old.0 as usize).and_then(|t| t.as_mut()) {
+                slot.fut = None;
             }
         }
         let task_id = TaskId(rt.tasks.len() as u32);
         rt.tasks.push(Some(TaskSlot {
             fut: Some(Box::pin(block)),
+            owner: Some(sid),
         }));
-        let entry = Box::new((key, task_id));
-        if cursor < s.slots.len() {
-            s.slots[cursor] = entry;
-        } else {
-            s.slots.push(entry);
-        }
+        rt.scopes[sid.0 as usize]
+            .as_mut()
+            .unwrap()
+            .slots
+            .set_data(cursor, Box::new((key, task_id)));
     });
 }
 
@@ -1310,29 +1582,26 @@ pub fn disposable_effect(key: u64) -> DisposableEffectGuard {
             }
         };
         let s = rt.scopes[sid.0 as usize].as_mut().unwrap();
-        if cursor < s.slots.len() {
-            if let Some((k, old)) = s.slots[cursor].downcast_mut::<(u64, Box<dyn FnMut()>)>() {
-                if *k == key {
-                    // 复用：旧清理器重新挂到本轮帧栈
-                    let old = std::mem::replace(old, Box::new(|| {}));
-                    let idx = frame.len();
-                    frame.push(old);
-                    s.slots[cursor] = Box::new((key, idx));
-                    return DisposableEffectGuard { idx, fresh: false };
-                }
-                // key 变化：先跑旧清理
-                let mut old = std::mem::replace(old, Box::new(|| {}));
-                old();
+        // 原语义：槽内存 `(u64, usize)`（frame 下标）；复用判定按 key。
+        // 注：历史代码 downcast 成 `(u64, Box<dyn FnMut>)` 永不命中，实际每轮都新建。
+        // 这里按正确类型迁移到 SlotTable，复用时把旧 frame 清理器重挂本轮帧。
+        let existing = s
+            .slots
+            .get_data(cursor)
+            .and_then(|b| b.downcast_ref::<(u64, usize)>())
+            .copied();
+        if let Some((k, old_idx)) = existing {
+            if k == key && old_idx < frame.len() {
+                let old = std::mem::replace(&mut frame[old_idx], Box::new(|| {}));
+                let idx = frame.len();
+                frame.push(old);
+                s.slots.set_data(cursor, Box::new((key, idx)));
+                return DisposableEffectGuard { idx, fresh: false };
             }
         }
         let idx = frame.len();
         frame.push(Box::new(|| {}));
-        let entry = Box::new((key, idx));
-        if cursor < s.slots.len() {
-            s.slots[cursor] = entry;
-        } else {
-            s.slots.push(entry);
-        }
+        s.slots.set_data(cursor, Box::new((key, idx)));
         DisposableEffectGuard { idx, fresh: true }
     })
 }
@@ -1373,8 +1642,9 @@ impl Composition {
             let sid = ScopeId(rt.scopes.len() as u32);
             rt.scopes.push(Some(ScopeData {
                 node: Some(root_node),
-                slots: Vec::new(),
+                slots: SlotTable::new(),
                 child_scopes: Vec::new(),
+                key: None,
                 run_cursor: 0,
                 child_cursor: 0,
                 content: None,
@@ -1404,10 +1674,32 @@ impl Composition {
         });
         run_scope(self.root_scope);
         Recomposer::recompose_pending();
+        // 首次组合也可能注册 SideEffect（recompose_pending 无 pending 时不会 drain）。
+        drain_post_recompose();
     }
 
     pub fn root_node(&self) -> NodeId {
         self.root_node
+    }
+
+    /// 销毁组合（关闭窗口时调用）：回收根作用域及其后代、释放根节点、清掉该根的
+    /// 视口与布局约束记录，并做一次节点 GC。
+    ///
+    /// 不做这一步的后果：根节点仍被 `root_nodes` 保活、动画/帧驱动/协程继续挂在已关闭
+    /// 窗口的作用域上（窗口关了还在跑），且下次 `add_node` 也无法复用这些槽位。
+    pub fn dispose(&self) {
+        let root = self.root_node;
+        with_rt(|rt| {
+            dispose_scope_rt(rt, self.root_scope);
+            rt.root_nodes.retain(|n| *n != root);
+            rt.last_constraints.remove(&root);
+            // 根节点无父节点 ⇒ 可达性 GC 会把它当「独立根」永远保活，必须显式释放。
+            crate::layout::release_node(rt, root);
+            rt.node_gc_pending = true;
+        });
+        drain_disposal_queue();
+        crate::layout::clear_viewport(root);
+        collect_node_garbage();
     }
 }
 

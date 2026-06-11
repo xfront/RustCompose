@@ -6,8 +6,8 @@ use compose::layout::{DrawCmd, TextStyle};
 use compose::prelude::Color;
 use valo::{
     Backdrop, Color as ValoColor, DisplayList, DisplayListBuilder, DrawParagraphExt, FillRule, Paint,
-    PaintStyle, PathBuilder, Point as ValoPoint, Rect as ValoRect, Stroke, ClipOp,
-    FontCollection, Paragraph, ParagraphBuilder, TextStyle as ValoTextStyle,
+    PaintStyle, PathBuilder, Point as ValoPoint, Rect as ValoRect, Stroke, ClipOp, FontCollection,
+    Paragraph, ParagraphBuilder, TextStyle as ValoTextStyle,
 };
 
 pub fn to_valo_color(c: &Color) -> ValoColor {
@@ -228,7 +228,7 @@ pub fn record_cmds(b: &mut DisplayListBuilder, cmds: &[DrawCmd], tc: &mut TextCo
             DrawCmd::GlassPanel { x, y, w, h, radius, tint, blur, highlight, outline, line } => {
                 let rect = to_valo_rect(*x, *y, *w, *h);
                 b.save();
-                b.clip_rrect(rect, *radius, ClipOp::Intersect);
+                b.clip_rrect(rect, *radius, ClipOp::Intersect, false);
                 // 背景模糊层：以模糊后的场景为底，孩子（tint / 高光）画在其上
                 b.save_layer_backdrop(Some(rect), &Paint::default(), Backdrop::blur(*blur));
                 let tint_paint = Paint { color: to_valo_color(tint), style: PaintStyle::Fill, ..Default::default() };
@@ -271,10 +271,48 @@ pub fn record_cmds(b: &mut DisplayListBuilder, cmds: &[DrawCmd], tc: &mut TextCo
             }
             DrawCmd::ClipPush { x, y, w, h, radius } => {
                 b.save();
-                b.clip_rrect(to_valo_rect(*x, *y, *w, *h), *radius, ClipOp::Intersect);
+                b.clip_rrect(to_valo_rect(*x, *y, *w, *h), *radius, ClipOp::Intersect, false);
             }
             DrawCmd::ClipPop => {
                 b.restore();
+            }
+            // GraphicsLayer：alpha 通过 save_layer 的空 Paint 实现整体合成；
+            // Transform 当前渲染后端（valo 0.13）无 builder 级变换，命令保留供上层/测试消费，
+            // GPU 变换留待渲染器支持（命令模型与 Compose 对齐）。
+            DrawCmd::SaveLayer { alpha, x, y, w, h } => {
+                let paint = Paint {
+                    color: to_valo_color(&Color::rgba(0.0, 0.0, 0.0, *alpha)),
+                    style: PaintStyle::Fill,
+                    ..Default::default()
+                };
+                b.save_layer(Some(to_valo_rect(*x, *y, *w, *h)), &paint);
+            }
+            DrawCmd::Restore => {
+                b.restore();
+            }
+            DrawCmd::Transform { .. } => {
+                // 渲染后端暂不支持命令级变换；命令已在 DrawCmd 流中保留。
+            }
+            DrawCmd::Image {
+                image_id,
+                x,
+                y,
+                w,
+                h,
+                ..
+            } => {
+                let rect = ValoRect::from_ltrb(*x, *y, *x + *w, *y + *h);
+                if let Some(img) = crate::render::image_cache::get_uploaded(*image_id) {
+                    // 纹理就绪：整图缩放填充到目标矩形（rgba8，线性过滤 + 边缘 clamp）。
+                    b.draw_image(&img, rect, &Paint::default());
+                } else {
+                    // 兜底占位（控件未就绪时应直接画占位；此处保证不会因 id 缺失而漏绘）。
+                    let ph = Paint {
+                        color: ValoColor::rgba(0.0, 0.0, 0.0, 0.12),
+                        ..Default::default()
+                    };
+                    b.draw_rect(rect, &ph);
+                }
             }
         }
     }

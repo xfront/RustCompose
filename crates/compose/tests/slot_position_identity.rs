@@ -13,13 +13,18 @@
 use compose::foundation::Constraints;
 use compose::layout::{create_root_node, Box, perform_layout, Modifier, Row};
 use compose::material::{ColorScheme, MaterialTheme};
-use compose::runtime::{advance_frame, mutableStateOf, remember, Composition, MutableState};
+use compose::runtime::{
+    advance_frame, emit_keyed_scope, mutableStateOf, remember, Composition, MutableState,
+};
 use std::cell::Cell;
 use std::rc::Rc;
 
 thread_local! {
     static TAB: Cell<Option<MutableState<usize>>> = const { Cell::new(None) };
     static TAB2: Cell<Option<MutableState<usize>>> = const { Cell::new(None) };
+    /// 键控作用域探针：分支状态句柄与分支 B 读到的值。
+    static KEYED_PAGE: Cell<Option<MutableState<usize>>> = const { Cell::new(None) };
+    static KEYED_SEEN: Cell<usize> = const { Cell::new(usize::MAX) };
 }
 
 #[test]
@@ -110,5 +115,51 @@ fn remember_identities_stable_across_child_scope_interleave() {
     TAB2.with(|c| c.get().unwrap().set(7));
     advance_frame(1.0 / 60.0);
     assert_eq!(tab2_probe.get(), 7, "tab2 身份应稳定保持最新写入值");
+    let _ = &comp;
+}
+
+/// 页面切换（同一位置渲染不同分支）时，普通位置复用会把上一分支的同类型
+/// `MutableState<usize>` 继承给新分支 → 新分支的 3 标签数组越界 panic。
+/// `emit_keyed_scope` 以 key 隔离：key 变化即清空 remember 槽，新分支重新初始化。
+#[test]
+fn keyed_scope_resets_remember_when_branch_changes() {
+    let root = create_root_node(compose::layout::Alignment::TopStart);
+    let comp = Composition::new(root);
+
+    comp.set_content(move || {
+        let page = remember(|| mutableStateOf(0usize));
+        KEYED_PAGE.with(|c| c.set(Some(page)));
+        let key = page.get();
+        emit_keyed_scope(key as u64, move || {
+            if key == 0 {
+                // 分支 A：第一个 remember 槽存一个越界值 3。
+                let _stale = remember(|| mutableStateOf(3usize));
+            } else {
+                // 分支 B：同样第一个 remember 槽；若继承 A 的状态就读到 3 → 越界 panic。
+                let tab = remember(|| mutableStateOf(0usize));
+                KEYED_SEEN.with(|c| c.set(tab.get()));
+                let _ = ["a", "b", "c"][tab.get()];
+            }
+        });
+    });
+
+    perform_layout(root, Constraints::tight(400.0, 400.0));
+    advance_frame(1.0 / 60.0);
+
+    // 切到分支 B：keyed scope 必须重建，tab 读到自己的初始值 0。
+    KEYED_PAGE.with(|c| c.get().unwrap().set(1));
+    advance_frame(1.0 / 60.0);
+    assert_eq!(
+        KEYED_SEEN.with(|c| c.get()),
+        0,
+        "键控作用域未隔离：分支 B 继承上一分支的状态值（应为 0）"
+    );
+
+    // 再切回 A、再切回 B：来回切换不得残留对方状态。
+    KEYED_PAGE.with(|c| c.get().unwrap().set(0));
+    advance_frame(1.0 / 60.0);
+    KEYED_PAGE.with(|c| c.get().unwrap().set(1));
+    advance_frame(1.0 / 60.0);
+    assert_eq!(KEYED_SEEN.with(|c| c.get()), 0, "往返切换后状态仍应独立");
     let _ = &comp;
 }

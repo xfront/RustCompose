@@ -17,12 +17,13 @@ use compose::foundation::Constraints;
 
 use compose::layout::{
     create_root_node, dispatch_char, dispatch_hover_at, dispatch_hover_left, dispatch_key,
-    dispatch_press_down, dispatch_press_up, dispatch_pull_down, dispatch_scroll,
+    dispatch_middle_click_at, dispatch_press_down, dispatch_press_up, dispatch_pull_down,
+    dispatch_scroll,
     dispatch_scrollbar_down, dispatch_secondary_click_at, drag_2d_end_global,
     drag_2d_move_global, drag_end_global,
     drag_move_global, draw_tree_tagged, hit_test,
     perform_layout, pull_end_global, pull_move_global, scrollbar_end_global,
-    scrollbar_move_global, set_last_pointer_global, set_text_measurer, set_viewport, Alignment,
+    scrollbar_move_global, set_last_pointer_global, set_text_measurer, set_viewport_for, Alignment,
     heuristic_text_at, TextMeasurer, TextStyle,
 };
 use compose::material::ColorScheme;
@@ -32,6 +33,7 @@ use crate::render::display_list::{
     build_cmds_display_list, build_display_list, new_frame_builder, record_cmds, TextContext,
 };
 use crate::render::gpu::GpuRenderer;
+use crate::render::image_cache;
 
 /// 用户应用 trait — 对齐 Compose `setContent { content }`。
 /// 从 compose-desktop 上移至此，供全部平台 crate 共享。
@@ -210,9 +212,32 @@ pub fn init_text_context(fc: valo::FontCollection) {
     });
 }
 
+/// 内核方法执行期间的「当前根」守卫：让布局/绘制失效能归属到正确的窗口根
+/// （多窗口共享一个 arena，失效是按根汇总的）。`Drop` 时恢复进入前的根。
+struct RootCtx(Option<compose::layout::NodeId>);
+
+impl RootCtx {
+    fn enter(root: compose::layout::NodeId) -> Self {
+        let prev = compose::layout::current_root();
+        compose::layout::set_current_root(Some(root));
+        Self(prev)
+    }
+}
+
+impl Drop for RootCtx {
+    fn drop(&mut self) {
+        compose::layout::set_current_root(self.0);
+    }
+}
+
 /// 平台无关应用内核：持有组合根 + 主题，驱动帧管线与事件派发。
+///
+/// 多窗口：每个窗口一个 `Kernel`（自己的根 / 组合 / 保留模式缓存 / GPU 表面），
+/// 它们共享同一线程的运行时 arena —— 节点与作用域 id 全局唯一，互不相交。
 pub struct Kernel {
     pub root: compose::layout::NodeId,
+    /// 本窗口的组合（关窗时 `dispose` 回收该根的作用域与节点）。
+    composition: Composition,
     pub theme: ColorScheme,
     last_frame: Instant,
     /// 是否已成功渲染过至少一帧。首帧必渲染；此后由增量脏区判据（`scene_is_clean` /
@@ -236,13 +261,28 @@ impl Kernel {
     /// 组合应用内容（等价 winit 后端 `resumed` 里的组合段）。
     /// 注意：不额外包 `MaterialTheme`（App::content 自行提供主题，主题切换才能重提供）。
     pub fn new(theme: ColorScheme, content: impl Fn() + 'static) -> Self {
+        Self::new_sized(theme, 800.0, 600.0, content)
+    }
+
+    /// 同 [`Kernel::new`]，但首帧组合前就注入视口尺寸。
+    /// 多窗口宿主建窗时已知尺寸：浮层（Dialog / Snackbar / 菜单）首帧居中才不会先错位一帧。
+    pub fn new_sized(
+        theme: ColorScheme,
+        width: f32,
+        height: f32,
+        content: impl Fn() + 'static,
+    ) -> Self {
         let root = create_root_node(Alignment::TopStart);
         // 文本度量器是线程局部、无状态的：注入一次即可（旧实现每帧 `Box::new` 一次
         // 分配，空闲帧也逃不掉）。
         set_text_measurer(Box::new(ValoTextMeasurer));
+        set_viewport_for(root, width, height);
+        let prev_root = compose::layout::current_root();
+        compose::layout::set_current_root(Some(root));
         let composition = Composition::new(root);
         composition.set_content(content);
-        Self { root, theme, last_frame: Instant::now(), has_rendered: false, retained: Default::default(), frame_draw: Default::default(), last_bg: None, cached_runs: Default::default(), used_chunks: Default::default(), last_w: 0.0, last_h: 0.0 }
+        compose::layout::set_current_root(prev_root);
+        Self { root, composition, theme, last_frame: Instant::now(), has_rendered: false, retained: Default::default(), frame_draw: Default::default(), last_bg: None, cached_runs: Default::default(), used_chunks: Default::default(), last_w: 0.0, last_h: 0.0 }
     }
 
     /// 渲染一帧：advance_frame → 重组 → 布局 → DisplayList → GPU。
@@ -250,12 +290,56 @@ impl Kernel {
     pub fn frame(&mut self, renderer: &mut GpuRenderer, width: f32, height: f32) -> bool {
         let delta = self.last_frame.elapsed().as_secs_f32().min(0.1);
         self.last_frame = Instant::now();
-
-        // 帧推进（重组 + 动画帧驱动 + 协程）
-        // 视口先注入：浮层（Dialog / Snackbar）在组合期就要读它做居中定位
-        set_viewport(width, height);
-        let t0 = Instant::now();
         advance_frame(delta);
+        self.render_inner(renderer, width, height, true)
+    }
+
+    /// 多窗口宿主专用：全局帧（[`advance_frame`]）已由宿主本轮推进过一次，
+    /// 本窗口只做 重组 / 布局 / 绘制。
+    ///
+    /// 续帧判据用非破坏读取：多个窗口轮流绘制时，先绘的窗口不能把
+    /// `FRAME_REQUEST` 吞掉（否则后绘的动画窗口会误判为静止而停摆）。
+    pub fn draw_frame(&mut self, renderer: &mut GpuRenderer, width: f32, height: f32) -> bool {
+        self.render_inner(renderer, width, height, false)
+    }
+
+    /// 销毁本窗口的组合（关窗时调用：回收该根的作用域 / 节点 / 视口记录）。
+    pub fn dispose(&mut self) {
+        self.composition.dispose();
+    }
+
+    fn render_inner(
+        &mut self,
+        renderer: &mut GpuRenderer,
+        width: f32,
+        height: f32,
+        consume_busy: bool,
+    ) -> bool {
+        // 续帧判据：`consume_busy` 时消耗「读取即清除」的请求（单窗口 / 内核自驱）；
+        // 否则只看「注册表非空 || 有请求」（由宿主统一清除）。
+        let busy_now = || {
+            let anim = if consume_busy {
+                compose::animation::animations_active()
+            } else {
+                compose::animation::running_animations() > 0
+                    || compose::animation::animations_requested()
+            };
+            anim || Recomposer::has_pending()
+        };
+
+        // 视口先注入：浮层（Dialog / Snackbar）在组合期就要读它做居中定位。
+        // 按根记录（多窗口）：别的窗口重组时不会读到本窗口的尺寸。
+        set_viewport_for(self.root, width, height);
+        // `RootCtx` 在函数退出（含各快路径早返回）时恢复进入前的根：
+        // 多窗口下遗留「当前根」会让别处的失效标记归属到错误窗口。
+        let _root = RootCtx::enter(self.root);
+        let t0 = Instant::now();
+        // 取回解码线程投递进来的位图像素（INBOX → pending），让本帧 recompose 使 `Image`
+        // 控件的 token 翻转、进而让保留模式静态块缓存失效并重绘。
+        let _ = image_cache::consume_decoded();
+        // 排空主线程任务队列（后台线程投递的文件对话框等结果回调），在重组前执行，
+        // 使回调里的 `MutableState::set` 能在同帧触发定向重组（此时运行时 RefCell 借用尚未建立）。
+        crate::runtime::drain_main_tasks();
         Recomposer::recompose_pending();
         let t1 = Instant::now();
 
@@ -270,8 +354,12 @@ impl Kernel {
         // 4) 增量脏区绘制。
         // 快路径①：画面已 settled（根无失效标记 = 本轮无重组 / 几何 / 滚动脏）且尺寸未变 →
         // 与上一帧逐命令相同 → 跳过整树绘制遍历、DisplayList 重建与 GPU 上传（空闲帧近乎零成本）。
-        if self.has_rendered && size_unchanged && compose::layout::scene_is_clean(root) {
-            let busy = compose::animation::animations_active() || Recomposer::has_pending();
+        if self.has_rendered
+            && size_unchanged
+            && compose::layout::scene_is_clean(root)
+            && !image_cache::pending_nonempty()
+        {
+            let busy = busy_now();
             trace_frame(FrameSample {
                 path: 0,
                 adv_ms: ms(t0, t1),
@@ -320,10 +408,11 @@ impl Kernel {
             && size_unchanged
             && !compose::layout::scene_changed()
             && !frame_draw.static_changed
+            && !image_cache::pending_nonempty()
         {
             self.last_w = width;
             self.last_h = height;
-            let busy = compose::animation::animations_active() || Recomposer::has_pending();
+            let busy = busy_now();
             trace_frame(FrameSample {
                 path: 1,
                 adv_ms: ms(t0, t1),
@@ -342,6 +431,9 @@ impl Kernel {
         let mut build_ms = 0.0f32;
         let mut gpu_ms = 0.0f32;
         let dyn_count = frame_draw.dynamic_cmds.len();
+        // 把待上传的 CPU 像素上传为 GPU 纹理（按 image_id 缓存复用），随后 build 时
+        // `record_cmds` 通过 `get_uploaded` 取得句柄绘制。
+        image_cache::upload_phase(renderer);
         TEXT_CTX.with(|cell| {
             let mut b = cell.borrow_mut();
             let Some(tc) = b.as_mut() else { return };
@@ -362,7 +454,7 @@ impl Kernel {
         self.has_rendered = true;
 
         // 5) 帧调度门控：动画进行中/有待重组 → 连续帧；否则宿主可休眠
-        let busy = compose::animation::animations_active() || Recomposer::has_pending();
+        let busy = busy_now();
         trace_frame(FrameSample {
             path: 2,
             adv_ms: ms(t0, t1),
@@ -424,6 +516,7 @@ impl Kernel {
 
     /// 指针按下（宿主触摸/鼠标 down）。
     pub fn pointer_down(&self, x: f32, y: f32) -> bool {
+        let _root = RootCtx::enter(self.root);
         set_last_pointer_global(x, y);
         let Some((target, _, _)) = hit_test(self.root, x, y) else { return false };
         dispatch_hover_at(target);
@@ -443,6 +536,7 @@ impl Kernel {
     /// 会立刻把刚弹出的菜单关掉。右键也不进入 `dispatch_press_down` 的按压/波纹链路，
     /// 避免产生左键式 ripple 与被 `dispatch_press_up` 结算成普通点击。
     pub fn pointer_secondary_click(&self, x: f32, y: f32) -> bool {
+        let _root = RootCtx::enter(self.root);
         set_last_pointer_global(x, y);
         let Some((target, lx, ly)) = hit_test(self.root, x, y) else {
             return false;
@@ -450,8 +544,20 @@ impl Kernel {
         dispatch_secondary_click_at(target, lx, ly)
     }
 
+    /// 中间按钮（鼠标中键）按下：在命中链上派发 `on_middle_click`（如 VS 中键关闭标签）。
+    /// 只处理按下、不进入按压/波纹链路，也不改变焦点。
+    pub fn pointer_middle_click(&self, x: f32, y: f32) -> bool {
+        let _root = RootCtx::enter(self.root);
+        set_last_pointer_global(x, y);
+        let Some((target, _, _)) = hit_test(self.root, x, y) else {
+            return false;
+        };
+        dispatch_middle_click_at(target)
+    }
+
     /// 指针移动（宿主 touch move / mouse move；优先驱动拖拽，其次下拉手势，否则悬停态）。
     pub fn pointer_move(&self, x: f32, y: f32) -> bool {
+        let _root = RootCtx::enter(self.root);
         set_last_pointer_global(x, y);
         if drag_move_global(x, y) {
             return true;
@@ -473,6 +579,7 @@ impl Kernel {
 
     /// 指针抬起（触摸 up / 鼠标释放；结束拖拽/下拉手势并结算按压点击）。
     pub fn pointer_up(&self, x: f32, y: f32) -> bool {
+        let _root = RootCtx::enter(self.root);
         set_last_pointer_global(x, y);
         // 一次只可能有一个手势会话，三个 `*_end` 与旧实现同样首个真即结束。
         let gesture = drag_end_global() || drag_2d_end_global() || pull_end_global()
@@ -490,14 +597,23 @@ impl Kernel {
         }
     }
 
+    /// 指针离开窗口（移向另一个窗口 / 移出窗口）：清悬停高亮。
+    /// 悬停态是全局单份（节点 id 全局唯一），不清理会在旧窗口里残留高亮。
+    pub fn pointer_leave(&self) -> bool {
+        let _root = RootCtx::enter(self.root);
+        dispatch_hover_left()
+    }
+
     /// 滚轮/滚动手势（dy > 0 = 向下）。
     pub fn scroll_at(&self, x: f32, y: f32, dy: f32) -> bool {
+        let _root = RootCtx::enter(self.root);
         let target = hit_test(self.root, x, y).map(|(t, _, _)| t);
         dispatch_scroll(target, dy)
     }
 
     /// 键盘导航键（方向键/PageUp/PageDown 由平台翻译为 NavKey）。
     pub fn key(&self, key: NavKey) -> bool {
+        let _root = RootCtx::enter(self.root);
         if dispatch_key(key) {
             return true;
         }
@@ -507,6 +623,7 @@ impl Kernel {
 
     /// 字符输入（路由：TextField 焦点优先 → 焦点作用域 type-ahead）。
     pub fn char(&self, ch: char) -> bool {
+        let _root = RootCtx::enter(self.root);
         if !crate::input_router::focused() && dispatch_char(ch) {
             return true;
         }
@@ -516,6 +633,7 @@ impl Kernel {
 
     /// 退格（路由到聚焦 TextField）。
     pub fn backspace(&self) {
+        let _root = RootCtx::enter(self.root);
         crate::input_router::backspace();
     }
 }

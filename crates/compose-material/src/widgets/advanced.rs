@@ -4,8 +4,9 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use compose::layout::{
-    Alignment, Arrangement, Column, CrossAxisAlignment, DrawBuilder, Modifier, NodeId, Policy, Row,
-    ScrollInfo, Spacer, TextStyle, add_node, with_content_scope,
+    Alignment, Arrangement, Box as LayoutBox, Canvas, Clickable, Column, CrossAxisAlignment,
+    DrawBuilder, Modifier, NodeId, Policy, Row, ScrollInfo, Spacer, TextStyle, add_node,
+    with_content_scope,
 };
 use compose::material::theme_colors;
 use compose::runtime::{
@@ -17,34 +18,34 @@ use crate::widgets::Text;
 
 // ══════════════════════════════ 滚动容器 ══════════════════════════════
 
-/// `VerticalScroll { content }` — 可纵向滚动的 Column。
+/// `VerticalScroll { content }` — 可纵向滚动的 Column。返回容器节点 id。
 pub fn VerticalScroll(
     modifier: Modifier,
     arrangement: Arrangement,
     cross: CrossAxisAlignment,
     content: impl Fn() + 'static,
-) {
+) -> NodeId {
     scroll_container(
         modifier.VerticalScroll(),
         true,
         Policy::Column { arrangement, cross },
         content,
-    );
+    )
 }
 
-/// `HorizontalScroll { content }` — 可横向滚动的 Row。
+/// `HorizontalScroll { content }` — 可横向滚动的 Row。返回容器节点 id。
 pub fn HorizontalScroll(
     modifier: Modifier,
     arrangement: Arrangement,
     cross: CrossAxisAlignment,
     content: impl Fn() + 'static,
-) {
+) -> NodeId {
     scroll_container(
         modifier.HorizontalScroll(),
         false,
         Policy::Row { arrangement, cross },
         content,
-    );
+    )
 }
 
 /// 滚动容器公共实现：节点每帧重建，把滚动偏移存在节点上会随重组（如内容变化、命中交互）
@@ -54,7 +55,7 @@ fn scroll_container(
     vertical: bool,
     policy: Policy,
     content: impl Fn() + 'static,
-) {
+) -> NodeId {
     let off = remember(|| Rc::new(Cell::new(0.0f32)));
     let id_cell = remember(|| Rc::new(Cell::new(None::<NodeId>)));
     let id = add_node(policy, modifier);
@@ -86,6 +87,7 @@ fn scroll_container(
     // 作用域销毁时注销帧驱动，避免驱动随滚动控件消失后继续驻留
     disposable_effect(0).on_dispose(move || remove_frame_driver(drv));
     with_content_scope(id, content);
+    id
 }
 
 // ══════════════════════════════ 日历 ══════════════════════════════
@@ -346,9 +348,32 @@ pub fn MediaSurface(label: &str, modifier: Modifier) {
 
 // ════════════════════ 补齐（advanced） ════════════════════
 
-/// `AutoHideToolbar(hidden, height) { content }` — 隐藏时高度动画收缩到 0 并裁剪。
+/// 收缩态可见细条厚度（对齐 cui `peekSize = 2`）。
+const AUTOHIDE_PEEK_H: f32 = 2.0;
+/// 收缩态隐形悬停容差（对齐 cui `kCollapsedTriggerMargin = 16`）：
+/// 条带外仍保留的可悬停热区，几像素的 peek 线很难精确命中。
+const AUTOHIDE_HOT_H: f32 = 16.0;
+/// peek 细条上沿的 accent 线高度（VS 文档井同款强调线）。
+const AUTOHIDE_ACCENT_H: f32 = 2.0;
+/// 指针离开工具栏后自动收回的延时（2 秒，对齐 cui `hideDelayMs = 2000`）。
+const AUTOHIDE_LEAVE_DELAY_NS: f64 = 2_000_000_000.0;
+
+/// `AutoHideToolbar(hidden, height) { content }` — 悬停显示、离开 2 秒后自动收回边缘。
 ///
-/// `hidden` 由调用方驱动（如滚动方向检测：下滚隐藏 / 上滚显示）。
+/// 对齐 cui `widgets/auto_hide_toolbar.h`（Microsoft Remote Desktop / TeamViewer
+/// 连接栏行为）：
+/// - **覆盖式**：条带悬浮在身后内容上方展开，不把内容往下推（调用方把它作为
+///   Box 的后置子项叠在 body 之上）；
+/// - **顶端边缘热区**：收缩态保留 [`AUTOHIDE_PEEK_H`] 可见细条 + [`AUTOHIDE_HOT_H`]
+///   隐形悬停容差（热区恒 ≥ 容差 ⇒ 展开途中鼠标停在边缘不会被"挤出"）；
+///   热区本身无 `on_click` ⇒ 不吃身后页面的点击（cui `MouseRegion(opaque=false)` 语义）；
+/// - **悬停即展开**，离开（含移出窗口）→ 2 秒延时收回；重新悬停取消未到期延时；
+/// - 点击细条同样展开（无 hover 输入设备兜底）；
+/// - 内容恒按 `height` 展开尺寸布局、由条带裁剪 ⇒ 条带逐帧变高不引起按钮重排
+///   （cui `ConstrainedBox(expandedConstraints) + Align(factor) + ClipRect` 同款）。
+///
+/// `hidden` 仍可被调用方驱动（如滚动方向检测：下滚隐藏 / 上滚显示），悬停状态与
+/// 外部驱动并存。
 pub fn AutoHideToolbar(
     hidden: MutableState<bool>,
     height: f32,
@@ -357,11 +382,82 @@ pub fn AutoHideToolbar(
 ) {
     use compose::animation::Tween;
     use compose::animation::animate_float_as_state;
+    use compose::layout::hoverable;
+    use compose::animation::{request_anim_frame_after, request_anim_frames};
+    use compose::runtime::frame_time_nanos;
     let h = hidden.get();
-    let t = animate_float_as_state(if h { 0.0 } else { 1.0 }, Tween::new(0.2));
-    compose::layout::Box(
-        modifier.fill_max_width().height(t * height).clip(0.0),
-        Alignment::TopStart,
-        content,
+    // 1 = 展开（height），0 = 隐藏（peek 细条）。
+    let t = animate_float_as_state(if h { 0.0 } else { 1.0 }, Tween::new(0.3));
+    let visible = AUTOHIDE_PEEK_H + (height - AUTOHIDE_PEEK_H) * t;
+    // 热区恒 ≥ 容差：收缩途中热区变小不会把仍停在边缘的鼠标"挤出去"。
+    let hot = visible.max(AUTOHIDE_HOT_H);
+    let colors = theme_colors();
+    let content = Rc::new(content);
+
+    // 收回延时截止帧时间（None = 无待收回）；hover 进入取消、离开重置。
+    let deadline: Rc<Cell<Option<f64>>> = remember(|| Rc::new(Cell::new(None)));
+    // 帧驱动轮询截止时间，到期收回（悬停中 deadline 为 None，零成本快路径）。
+    // 关键：等待期间每帧 request_anim_frames 续帧 + request_anim_frame_after 定点
+    // 唤醒——空闲停驱机制下宿主可能已休眠，没有续帧请求「离开 2 秒收回」永不触发。
+    let drv = remember(|| {
+        let (hidden, deadline) = (hidden, deadline.clone());
+        add_frame_driver(move || {
+            if let Some(dl) = deadline.get() {
+                let now = frame_time_nanos();
+                if now >= dl {
+                    deadline.set(None);
+                    hidden.set(true);
+                } else {
+                    request_anim_frames();
+                    request_anim_frame_after(((dl - now) / 1e9).ceil() as f32);
+                }
+            }
+        })
+    });
+    disposable_effect(0).on_dispose(move || remove_frame_driver(drv));
+    let hidden_hover = hidden;
+    let deadline_hover = deadline.clone();
+
+    // 外层 = 热区（hoverable，条带 + 容差都悬在其上；自带 Box 语义，条带覆盖其上）。
+    // 热区无 on_click ⇒ 容差区点击穿透（不吃身后页面）；悬停进入即展开。
+    hoverable(
+        Modifier::new().fill_max_width().height(hot),
+        move |hovered| {
+            if hovered {
+                deadline_hover.set(None);
+                hidden_hover.set(false);
+            } else {
+                // 离开即预约定点唤醒：宿主空闲休眠时也会在 ~2s 后醒来收回。
+                deadline_hover.set(Some(frame_time_nanos() + AUTOHIDE_LEAVE_DELAY_NS));
+                request_anim_frame_after(2.0);
+            }
+        },
+        move || {
+            let hidden_c = hidden;
+            let content = content.clone();
+            let band_mod = modifier.clone();
+            // 条带：调用方 modifier（含背景）+ 逐帧可见高度 + 裁剪；溢出部分既不绘制也不命中。
+            Clickable(
+                band_mod.fill_max_width().height(visible).clip(0.0),
+                move || hidden_c.set(false),
+                move || {
+                    // 内容恒按展开尺寸布局，TopStart 对齐，随条带收缩被裁掉底部。
+                    let inner = content.clone();
+                    LayoutBox(
+                        Modifier::new().fill_max_width().height(height),
+                        Alignment::TopStart,
+                        move || inner(),
+                    );
+                    // 仅在隐藏态画 accent 细条：随 t→1 淡出，展开后不干扰工具栏外观。
+                    let accent_a = (1.0 - t).clamp(0.0, 1.0);
+                    if accent_a > 0.01 {
+                        let accent = colors.primary.with_alpha(accent_a);
+                        Canvas(Modifier::new().fill_max_width().height(AUTOHIDE_ACCENT_H), move |b, x, y, w, _| {
+                            b.fill_rect(x, y, w, AUTOHIDE_ACCENT_H, accent);
+                        });
+                    }
+                },
+            );
+        },
     );
 }

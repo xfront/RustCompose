@@ -1,7 +1,17 @@
-//! 回归用例：拖拽会话（splitter 比例计算）纯逻辑正确。
+//! 回归用例：拖拽会话（splitter 比例计算 / 二维拖拽释放回调）纯逻辑正确。
 
-use compose::layout::{begin_drag_session, drag_end_global, drag_move_global};
+use std::cell::Cell;
+
+use compose::layout::{
+    begin_drag_2d_with_end, begin_drag_session, drag_2d_end_global, drag_2d_move_global,
+    drag_end_global, drag_move_global, set_last_pointer_global,
+};
 use compose::runtime::mutableStateOf;
+
+thread_local! {
+    static END_XY: Cell<Option<(f32, f32)>> = const { Cell::new(None) };
+    static MOVE_COUNT: Cell<usize> = const { Cell::new(0) };
+}
 
 #[test]
 fn horizontal_drag_updates_ratio() {
@@ -40,4 +50,27 @@ fn end_drag_clears_session() {
     assert!(drag_end_global());
     // 结束后 move 不再触发拖拽
     assert!(!drag_move_global(10.0, 0.0));
+}
+
+#[test]
+fn drag_2d_end_hook_receives_final_pointer() {
+    // Docking 靠这个回调在「抬起那一刻」结算放置目标，必须收到最终全局坐标。
+    END_XY.with(|c| c.set(None));
+    MOVE_COUNT.with(|c| c.set(0));
+    begin_drag_2d_with_end(
+        |_x, _y| MOVE_COUNT.with(|c| c.set(c.get() + 1)),
+        |x, y| END_XY.with(|c| c.set(Some((x, y)))),
+    );
+    assert!(drag_2d_move_global(10.0, 20.0));
+    assert!(drag_2d_move_global(30.0, 40.0));
+    assert_eq!(MOVE_COUNT.with(|c| c.get()), 2, "移动回调应逐次触发");
+    set_last_pointer_global(77.0, 88.0);
+    assert!(drag_2d_end_global(), "抬起应报告存在活动会话");
+    assert_eq!(
+        END_XY.with(|c| c.get()),
+        Some((77.0, 88.0)),
+        "释放回调应收到最终指针"
+    );
+    assert!(!drag_2d_move_global(0.0, 0.0), "结束后会话应清空");
+    assert!(!drag_2d_end_global(), "重复抬起不应再触发回调");
 }

@@ -191,7 +191,9 @@ fn live_chunk_between_static_chunks_keeps_z_order() {
     let _ = device.poll(wgpu::PollType::wait_indefinitely());
 
     let data = read_back(&device, &queue, &off);
-    assert_eq!(px(&data, 20, 20)[0..3], [0, 0, 255], "后来的静态块须盖住现场块");
+    // 取样点须避开末尾段落的墨迹（字体度量不同会改变字形覆盖区域）——
+    // 蓝矩 y=8..32，段落 y=16 起，取 (10,10) 只验证「后来的静态块盖住现场块」。
+    assert_eq!(px(&data, 10, 10)[0..3], [0, 0, 255], "后来的静态块须盖住现场块");
     assert!(dark_px(&data) > 20, "末尾嵌套的段落墨迹没落到目标上");
     assert_eq!(px(&data, 2, 60)[0..3], [255, 255, 255], "整屏背景应打底");
 }

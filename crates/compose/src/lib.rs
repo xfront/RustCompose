@@ -51,6 +51,23 @@ pub use render::{
     close_window, current_window, open_window, run_app, run_app_with, window_count, WindowConfig,
     WindowHandle,
 };
+#[cfg(all(
+    not(target_os = "android"),
+    not(target_env = "ohos"),
+    not(target_os = "ios")
+))]
+pub use render::{
+    on_maximized_changed, set_fullscreen, set_maximized, set_minimized, start_window_drag,
+    start_window_resize, ResizeEdge,
+};
+
+/// 原始窗口输入分流钩子（远程桌面转发用；仅桌面 / Web）。
+#[cfg(all(
+    not(target_os = "android"),
+    not(target_env = "ohos"),
+    not(target_os = "ios")
+))]
+pub mod raw_input;
 #[cfg(target_os = "android")]
 pub use platform::android::{AndroidApp, android_entry, run_app_with_android};
 

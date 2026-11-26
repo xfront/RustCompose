@@ -423,6 +423,9 @@ pub enum IconName {
     Pin,
     Rocket,
     Cart,
+    Minimize,
+    Maximize,
+    Fullscreen,
 }
 
 /// 归一化坐标 → 绝对点。
@@ -1657,6 +1660,42 @@ pub fn draw_icon(b: &mut DrawBuilder, name: IconName, x: f32, y: f32, s: f32, co
             b.stroke_path(&[p(0.34, 0.44), p(0.78, 0.44)], color, lw * 1.1);
             b.fill_circle(x + s * 0.40, y + s * 0.86, s * 0.07, color);
             b.fill_circle(x + s * 0.72, y + s * 0.86, s * 0.07, color);
+        }
+        IconName::Minimize => {
+            b.line(
+                p(0.24, 0.72).0,
+                p(0.24, 0.72).1,
+                p(0.76, 0.72).0,
+                p(0.76, 0.72).1,
+                color,
+                lw * 1.5,
+            );
+        }
+        IconName::Maximize => {
+            b.stroke_rrect(
+                x + s * 0.22,
+                y + s * 0.22,
+                s * 0.56,
+                s * 0.56,
+                s * 0.06,
+                color,
+                lw * 1.2,
+            );
+        }
+        IconName::Fullscreen => {
+            let c2 = lw * 1.3;
+            for (ax, ay, bx, by) in [
+                (0.20, 0.20, 0.40, 0.20),
+                (0.20, 0.20, 0.20, 0.40),
+                (0.80, 0.20, 0.60, 0.20),
+                (0.80, 0.20, 0.80, 0.40),
+                (0.20, 0.80, 0.40, 0.80),
+                (0.20, 0.80, 0.20, 0.60),
+                (0.80, 0.80, 0.60, 0.80),
+                (0.80, 0.80, 0.80, 0.60),
+            ] {
+                b.line(p(ax, ay).0, p(ax, ay).1, p(bx, by).0, p(bx, by).1, color, c2);
+            }
         }
     }
 }

@@ -39,3 +39,12 @@ pub use host::{
     close_window, current_window, open_window, run_app, run_app_with, window_count, WindowConfig,
     WindowHandle,
 };
+#[cfg(all(
+    not(target_os = "android"),
+    not(target_env = "ohos"),
+    not(target_os = "ios")
+))]
+pub use host::{
+    on_maximized_changed, set_fullscreen, set_maximized, set_minimized, start_window_drag,
+    start_window_resize, ResizeEdge,
+};

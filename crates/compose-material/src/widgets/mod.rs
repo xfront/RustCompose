@@ -244,7 +244,7 @@ pub use input::{
     PopupMenuButton, RadioGroup, RatingBar, RichTextEdit, SetShiftState, Slider, SpinBox, Switch,
     SwitchRow, TextField, TimePicker, TokenInput, TriState, TriStateCheckbox,
     dropdown_menu_sections, menu_panel, menu_panel_auto_width, menu_panel_sections,
-    run_menu_callback, set_menu_callback,
+    run_menu_callback, set_menu_callback, set_on_submit,
 };
 pub use rich_text_editor::{RichTextEditor, RichTextEditorHandle, rich_editor_focus};
 #[cfg(compose_ffmpeg)]

@@ -220,9 +220,23 @@ pub fn with_runtime<R>(f: impl FnOnce(&mut RuntimeData) -> R) -> R {
 /// 送回 GUI 线程——因为 `MutableState` 写入只能在主线程运行时里进行。
 static MAIN_TASKS: Mutex<Vec<Box<dyn FnOnce() + Send>>> = Mutex::new(Vec::new());
 
+/// 跨线程唤醒钩子：宿主在启动事件循环后注入一个「唤醒 winit 事件循环」的闭包。
+/// `post_to_main` 入队后调用它，保证后台线程投递的任务能及时被主线程排空
+/// （否则事件循环 `ControlFlow::Wait` 休眠时，任务会一直等到下一次用户事件）。
+static WAKE_HOOK: Mutex<Option<Box<dyn Fn() + Send + Sync>>> = Mutex::new(None);
+
+/// 注入唤醒钩子（宿主入口调用一次）。
+pub fn set_wake_hook(f: impl Fn() + Send + Sync + 'static) {
+    *WAKE_HOOK.lock().unwrap() = Some(Box::new(f));
+}
+
 /// 把一个任务投递到主线程（GUI 运行时线程）执行。供后台线程回传结果。
+/// 入队后立即经唤醒钩子泵一次事件循环，确保休眠期也能及时送达。
 pub fn post_to_main(f: impl FnOnce() + Send + 'static) {
     MAIN_TASKS.lock().unwrap().push(Box::new(f));
+    if let Some(h) = WAKE_HOOK.lock().unwrap().as_ref() {
+        h();
+    }
 }
 
 /// 排空主线程任务队列。`Kernel::frame` 在重组前调用——此时运行时 `RefCell` 借用尚未建立，

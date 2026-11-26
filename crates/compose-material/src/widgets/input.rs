@@ -48,6 +48,9 @@ thread_local! {
     /// 各输入框所在的组合作用域：`state key → scope`。焦点本身存在线程局部里，
     /// 读它不会建立依赖，所以焦点变化必须自己调度新旧两个作用域重组。
     static FIELD_SCOPE: RefCell<HashMap<u32, ScopeId>> = RefCell::new(HashMap::new());
+    /// 单行输入框的回车提交回调：`state key → 回调`。组合期经 `set_on_submit` 登记，
+    /// `InputEnter` 在聚焦单行框时按 key 命中并触发（富文本框不走此路）。
+    static FIELD_SUBMIT: RefCell<HashMap<u32, Box<dyn FnMut()>>> = RefCell::new(HashMap::new());
 }
 
 /// 是否存在获得焦点的 TextField（平台据此决定字符路由到输入框还是逐字搜索）。
@@ -2589,7 +2592,7 @@ fn rich_select_all_field(st: MutableState<String>) {
     with_rich(st, |chars, sel| rich_select_all(chars, sel));
 }
 
-/// 回车：在光标处插入换行（替换选区）。
+/// 回车：富文本框插入换行；单行输入框触发其 `set_on_submit` 登记的提交回调。
 pub fn InputEnter() {
     if rich_editor_focused() {
         rich_enter();
@@ -2597,10 +2600,69 @@ pub fn InputEnter() {
     }
     if let Some(st) = FOCUSED_RICH.with(|f| f.get()) {
         rich_insert_text(st, "\n");
+        return;
+    }
+    if let Some(st) = FOCUSED_FIELD.with(|f| f.get()) {
+        let key = state_id(st);
+        FIELD_SUBMIT.with(|m| {
+            if let Some(f) = m.borrow_mut().get_mut(&key) {
+                f();
+            }
+        });
     }
 }
 
-/// Ctrl+C：复制选区到剪贴板。
+/// 给单行输入框登记「按回车触发」的提交回调（组合期调用，同一字段重复登记覆盖旧的）。
+pub fn set_on_submit(value: MutableState<String>, f: impl FnMut() + 'static) {
+    FIELD_SUBMIT.with(|m| {
+        m.borrow_mut().insert(state_id(value), Box::new(f));
+    });
+}
+
+// 单行 TextField 无选区模型（只有 FIELD_CARET 光标索引），故 copy/cut 作用于整段值，
+// paste 在光标处插入剪贴板文本（丢弃换行以保持单行）。
+
+/// 单行框 Ctrl+C：复制整段文本到系统剪贴板。
+fn field_copy(st: MutableState<String>) {
+    let s = st.read_clone();
+    let _ = compose::platform::clipboard::set_text(&s);
+}
+
+/// 单行框 Ctrl+X：复制整段到系统剪贴板后清空并把光标归零。
+fn field_cut(st: MutableState<String>) {
+    let s = st.read_clone();
+    let _ = compose::platform::clipboard::set_text(&s);
+    st.set(String::new());
+    if let Some(c) = field_caret(st) {
+        c.set(0);
+    }
+}
+
+/// 单行框 Ctrl+V：在光标处插入系统剪贴板文本（过滤换行）。
+fn field_paste(st: MutableState<String>) {
+    let clip: String = compose::platform::clipboard::get_text()
+        .unwrap_or_default()
+        .chars()
+        .filter(|c| *c != '\n' && *c != '\r')
+        .collect();
+    if clip.is_empty() {
+        return;
+    }
+    match field_caret(st) {
+        Some(caret) => {
+            let mut v: Vec<char> = st.read_clone().chars().collect();
+            let i = caret.get().min(v.len());
+            let ins: Vec<char> = clip.chars().collect();
+            let n = ins.len();
+            v.splice(i..i, ins);
+            st.set(v.into_iter().collect());
+            caret.set(i + n);
+        }
+        None => st.update(|s| s.push_str(&clip)),
+    }
+}
+
+/// Ctrl+C：复制选区到剪贴板（单行框复制整段）。
 pub fn InputCopy() {
     if rich_editor_focused() {
         rte_copy();
@@ -2608,10 +2670,14 @@ pub fn InputCopy() {
     }
     if let Some(st) = FOCUSED_RICH.with(|f| f.get()) {
         rich_copy_to_clipboard(st);
+        return;
+    }
+    if let Some(st) = FOCUSED_FIELD.with(|f| f.get()) {
+        field_copy(st);
     }
 }
 
-/// Ctrl+X：剪切选区到剪贴板。
+/// Ctrl+X：剪切选区到剪贴板（单行框剪切整段）。
 pub fn InputCut() {
     if rich_editor_focused() {
         rte_cut();
@@ -2619,10 +2685,14 @@ pub fn InputCut() {
     }
     if let Some(st) = FOCUSED_RICH.with(|f| f.get()) {
         rich_cut_to_clipboard(st);
+        return;
+    }
+    if let Some(st) = FOCUSED_FIELD.with(|f| f.get()) {
+        field_cut(st);
     }
 }
 
-/// Ctrl+V：从剪贴板粘贴（替换选区，支持多行）。
+/// Ctrl+V：从剪贴板粘贴（富文本替换选区；单行框在光标处插入）。
 pub fn InputPaste() {
     if rich_editor_focused() {
         rte_paste();
@@ -2630,6 +2700,10 @@ pub fn InputPaste() {
     }
     if let Some(st) = FOCUSED_RICH.with(|f| f.get()) {
         rich_paste_from_clipboard(st);
+        return;
+    }
+    if let Some(st) = FOCUSED_FIELD.with(|f| f.get()) {
+        field_paste(st);
     }
 }
 

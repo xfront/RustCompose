@@ -50,6 +50,7 @@ mod winit_host {
     thread_local! {
         static KMOD_SHIFT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         static KMOD_CTRL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        static KMOD_ALT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 
     /// 窗口初始配置（标题 + 逻辑尺寸），由宿主入口注入，库内不写死。
@@ -62,6 +63,9 @@ mod winit_host {
         pub title: String,
         pub width: Option<f64>,
         pub height: Option<f64>,
+        pub decorations: bool,
+        /// Border thickness (logical px) that starts an OS resize drag; 0 disables.
+        pub resize_border: f32,
     }
 
     impl Default for WindowConfig {
@@ -70,6 +74,8 @@ mod winit_host {
                 title: "compose — Jetpack Compose style GUI for Rust".into(),
                 width: None,
                 height: None,
+                decorations: true,
+                resize_border: 0.0,
             }
         }
     }
@@ -77,7 +83,24 @@ mod winit_host {
     impl WindowConfig {
         /// 显式指定逻辑尺寸。
         pub fn sized(title: impl Into<String>, width: f64, height: f64) -> Self {
-            Self { title: title.into(), width: Some(width), height: Some(height) }
+            Self {
+                title: title.into(),
+                width: Some(width),
+                height: Some(height),
+                decorations: true,
+                resize_border: 0.0,
+            }
+        }
+        /// Borderless window: the app draws its own title bar / window controls.
+        pub fn undecorated(mut self) -> Self {
+            self.decorations = false;
+            self
+        }
+        /// Enable borderless edge/corner resize with a grip band of `px` logical
+        /// pixels. `0.0` (default) disables it.
+        pub fn resizable(mut self, px: f32) -> Self {
+            self.resize_border = px;
+            self
         }
     }
 
@@ -95,6 +118,10 @@ mod winit_host {
         listener: compose::runtime::RecomposeListener,
         /// 本窗口内最后一次指针位置（物理像素）：按下/抬起事件本身不带坐标。
         mouse: (f32, f32),
+        /// 边缘缩放命中带厚度（逻辑像素）；0 关闭。
+        resize_border: f32,
+        /// 上次已知的真实最大化状态（在 `WE::Resized` 里比对，变化才触发回调）。
+        maximized: bool,
     }
 
     /// 待建窗口请求（在组合 / 事件回调里登记，事件循环下一轮执行）。
@@ -170,6 +197,96 @@ mod winit_host {
         SLOTS.with(|s| s.borrow().len())
     }
 
+    /// 待处理的窗口控制请求（全屏 / 最小化）：组合期 / 事件回调里登记，drain 时统一执行
+    /// （事件派发期间该窗口槽位被 `take_slot` 取出，无法即时命中，故排队到下一轮）。
+    #[derive(Clone, Copy)]
+    enum WinCtl {
+        Fullscreen(bool),
+        Minimize(bool),
+        Maximize(bool),
+    }
+
+    thread_local! {
+        static PENDING_WINCTL: std::cell::RefCell<Vec<(WindowHandle, WinCtl)>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// 设置窗口无边框全屏 / 取消全屏（下一轮事件循环生效）。
+    pub fn set_fullscreen(handle: WindowHandle, on: bool) {
+        PENDING_WINCTL.with(|q| q.borrow_mut().push((handle, WinCtl::Fullscreen(on))));
+        wake();
+    }
+
+    /// 最小化 / 还原窗口（下一轮事件循环生效）。
+    pub fn set_minimized(handle: WindowHandle, on: bool) {
+        PENDING_WINCTL.with(|q| q.borrow_mut().push((handle, WinCtl::Minimize(on))));
+        wake();
+    }
+
+    /// Maximize / restore a window (applied on the next event-loop turn).
+    pub fn set_maximized(handle: WindowHandle, on: bool) {
+        PENDING_WINCTL.with(|q| q.borrow_mut().push((handle, WinCtl::Maximize(on))));
+        wake();
+    }
+
+    thread_local! {
+        /// Window whose OS-level move should start on this event-loop turn.
+        /// Set by a title-bar press handler, drained in `window_event` while the
+        /// slot is still in hand (so `drag_window` runs in the same mouse turn).
+        static DRAG_REQUEST: std::cell::Cell<Option<WindowHandle>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    /// Begin an OS window drag (borderless custom title bar). Call from a
+    /// pointer-press handler; executed within the same `window_event` turn.
+    pub fn start_window_drag(handle: WindowHandle) {
+        DRAG_REQUEST.with(|d| d.set(Some(handle)));
+        wake();
+    }
+
+    /// Which window border a resize drag should grab (mirrors winit
+    /// `ResizeDirection`; kept neutral so winit types stay out of the API).
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub enum ResizeEdge {
+        North,
+        South,
+        East,
+        West,
+        NorthEast,
+        NorthWest,
+        SouthEast,
+        SouthWest,
+    }
+
+    thread_local! {
+        /// Window + border whose OS resize should start this event-loop turn.
+        static RESIZE_REQUEST: std::cell::Cell<Option<(WindowHandle, ResizeEdge)>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    /// Begin an OS window resize from a border (borderless edge drag). Call from
+    /// a pointer-press handler; executed within the same `window_event` turn.
+    pub fn start_window_resize(handle: WindowHandle, edge: ResizeEdge) {
+        RESIZE_REQUEST.with(|r| r.set(Some((handle, edge))));
+        wake();
+    }
+
+    thread_local! {
+        /// Per-window callbacks fired when the real maximized state flips
+        /// (detected in `WE::Resized`, the only spot the slot + `is_maximized()`
+        /// are both reachable — composition runs with the slot taken out).
+        static MAX_HOOKS: std::cell::RefCell<
+            Vec<(WindowHandle, Box<dyn FnMut(bool)>)>,
+        > = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// Mirror a window's real maximized state into the app. The callback runs on
+    /// the main thread inside `window_event`; register it once, e.g. from the
+    /// first composition where `current_window()` is the target window.
+    pub fn on_maximized_changed(handle: WindowHandle, f: impl FnMut(bool) + 'static) {
+        MAX_HOOKS.with(|v| v.borrow_mut().push((handle, Box::new(f))));
+    }
+
     /// 事件派发 / 组合期间的「当前窗口」守卫，`Drop` 时恢复进入前的值。
     struct WindowCtx(Option<WindowHandle>);
 
@@ -220,6 +337,9 @@ mod winit_host {
         if let (Some(w), Some(h)) = (config.width, config.height) {
             attrs = attrs.with_inner_size(winit::dpi::LogicalSize::new(w, h));
         }
+        if !config.decorations {
+            attrs = attrs.with_decorations(false);
+        }
         let window = Arc::new(event_loop.create_window(attrs).ok()?);
         // 开启输入法（IME）：中文等合成输入依赖 Ime 事件，默认窗口未启用。
         window.set_ime_allowed(true);
@@ -254,7 +374,16 @@ mod winit_host {
         });
 
         window.request_redraw();
-        Some(WindowSlot { handle, window, renderer, kernel, listener, mouse: (0.0, 0.0) })
+        Some(WindowSlot {
+            handle,
+            window,
+            renderer,
+            kernel,
+            listener,
+            mouse: (0.0, 0.0),
+            resize_border: config.resize_border,
+            maximized: false,
+        })
     }
 
     struct Handler {
@@ -303,6 +432,25 @@ mod winit_host {
                 if let Some(slot) = create_slot(event_loop, req) {
                     put_slot(slot);
                 }
+            }
+            let ctrls = PENDING_WINCTL.with(|q| std::mem::take(&mut *q.borrow_mut()));
+            for (handle, ctl) in ctrls {
+                SLOTS.with(|s| {
+                    if let Some(slot) = s.borrow().iter().find(|x| x.handle == handle) {
+                        match ctl {
+                            WinCtl::Fullscreen(on) => slot.window.set_fullscreen(
+                                if on {
+                                    Some(winit::window::Fullscreen::Borderless(None))
+                                } else {
+                                    None
+                                },
+                            ),
+                            WinCtl::Minimize(on) => slot.window.set_minimized(on),
+                            WinCtl::Maximize(on) => slot.window.set_maximized(on),
+                        }
+                        slot.window.request_redraw();
+                    }
+                });
             }
             if self.started && SLOTS.with(|s| s.borrow().is_empty()) {
                 event_loop.exit();
@@ -378,6 +526,68 @@ mod winit_host {
             };
             let ctx = WindowCtx::enter(slot.handle);
             let handle = slot.handle;
+            // ── 原始输入分流（远程桌面转发）：默认路由前交给已登记的窗口处理器。
+            // 处理器返回 true = 已消费（跳过本地 UI 路由）；返回 false = 照常走本地。
+            {
+                use crate::raw_input::{RawEvent, RawKeyEvent};
+                let (mx, my) = slot.mouse;
+                let isz = slot.window.inner_size();
+                let (sw, sh) = (isz.width as f32, isz.height as f32);
+                let raw = match &event {
+                    WE::CursorMoved { position, .. } => {
+                        Some(RawEvent::Move { x: position.x as f32, y: position.y as f32 })
+                    }
+                    WE::MouseInput { state, button, .. } => {
+                        let b = match button {
+                            MouseButton::Left => 0u8,
+                            MouseButton::Middle => 1u8,
+                            MouseButton::Right => 2u8,
+                            _ => 3u8,
+                        };
+                        match state {
+                            ElementState::Pressed => {
+                                Some(RawEvent::Press { x: mx, y: my, button: b })
+                            }
+                            ElementState::Released => {
+                                Some(RawEvent::Release { x: mx, y: my, button: b })
+                            }
+                        }
+                    }
+                    WE::MouseWheel { delta, .. } => {
+                        let (dx, dy) = match delta {
+                            winit::event::MouseScrollDelta::LineDelta(x, y) => (*x as f32, *y as f32),
+                            winit::event::MouseScrollDelta::PixelDelta(p) => (p.x as f32, p.y as f32),
+                        };
+                        Some(RawEvent::Wheel { x: mx, y: my, dx, dy })
+                    }
+                    WE::KeyboardInput { event: k, .. } => {
+                        let shift = KMOD_SHIFT.with(|s| s.get());
+                        let ctrl = KMOD_CTRL.with(|c| c.get());
+                        let alt = KMOD_ALT.with(|a| a.get());
+                        let key = match &k.logical_key {
+                            winit::keyboard::Key::Character(c) => c.to_string(),
+                            winit::keyboard::Key::Named(n) => format!("{n:?}"),
+                            _ => String::new(),
+                        };
+                        Some(RawEvent::Key(RawKeyEvent {
+                            press: k.state == ElementState::Pressed,
+                            key,
+                            shift,
+                            ctrl,
+                            alt,
+                        }))
+                    }
+                    _ => None,
+                };
+                if let Some(r) = raw {
+                    if crate::raw_input::dispatch(&handle, &r, sw, sh) {
+                        slot.window.request_redraw();
+                        drop(ctx);
+                        put_slot(slot);
+                        return;
+                    }
+                }
+            }
             match event {
                 WE::CloseRequested => {
                     Recomposer::off_recompose(slot.listener);
@@ -391,6 +601,20 @@ mod winit_host {
                 }
                 WE::Resized(size) => {
                     slot.renderer.resize(size.width, size.height);
+                    // Maximize / restore always changes the inner size, so this is
+                    // where the WM's real state becomes observable. Compare against
+                    // the cached edge and notify only on an actual transition.
+                    let m = slot.window.is_maximized();
+                    if m != slot.maximized {
+                        slot.maximized = m;
+                        MAX_HOOKS.with(|v| {
+                            for (h, f) in v.borrow_mut().iter_mut() {
+                                if *h == handle {
+                                    f(m);
+                                }
+                            }
+                        });
+                    }
                     slot.window.request_redraw();
                 }
                 WE::RedrawRequested => self.pump(&mut slot),
@@ -424,7 +648,9 @@ mod winit_host {
                 } => {
                     let (mx, my) = slot.mouse;
                     self.active = Some(handle);
-                    slot.kernel.pointer_down(mx, my);
+                    if !try_edge_resize(&mut slot, mx, my) {
+                        slot.kernel.pointer_down(mx, my);
+                    }
                     slot.window.request_redraw();
                 }
                 WE::MouseInput {
@@ -473,6 +699,7 @@ mod winit_host {
                     let ms = mods.state();
                     KMOD_SHIFT.with(|s| s.set(ms.shift_key()));
                     KMOD_CTRL.with(|c| c.set(ms.control_key()));
+                    KMOD_ALT.with(|a| a.set(ms.alt_key()));
                 }
                 WE::KeyboardInput { event, .. } => {
                     if event.state == ElementState::Pressed {
@@ -580,6 +807,27 @@ mod winit_host {
                 }
                 _ => {}
             }
+            if DRAG_REQUEST.with(|d| d.get()) == Some(handle) {
+                DRAG_REQUEST.with(|d| d.set(None));
+                let _ = slot.window.drag_window();
+            }
+            let pending_resize = RESIZE_REQUEST.with(|r| r.get());
+            if let Some((rh, edge)) = pending_resize {
+                if rh == handle {
+                    RESIZE_REQUEST.with(|r| r.set(None));
+                    let dir = match edge {
+                        ResizeEdge::North => winit::window::ResizeDirection::North,
+                        ResizeEdge::South => winit::window::ResizeDirection::South,
+                        ResizeEdge::East => winit::window::ResizeDirection::East,
+                        ResizeEdge::West => winit::window::ResizeDirection::West,
+                        ResizeEdge::NorthEast => winit::window::ResizeDirection::NorthEast,
+                        ResizeEdge::NorthWest => winit::window::ResizeDirection::NorthWest,
+                        ResizeEdge::SouthEast => winit::window::ResizeDirection::SouthEast,
+                        ResizeEdge::SouthWest => winit::window::ResizeDirection::SouthWest,
+                    };
+                    let _ = slot.window.drag_resize_window(dir);
+                }
+            }
             drop(ctx);
             put_slot(slot);
         }
@@ -587,6 +835,8 @@ mod winit_host {
         fn user_event(&mut self, event_loop: &winit::event_loop::ActiveEventLoop, _event: ()) {
             // 组合/回调里登记的开窗、关窗请求：由事件循环统一执行。
             self.drain_requests(event_loop);
+            // 后台线程 post_to_main 唤醒：请求重绘以在各窗口 pump 中排空主线程任务队列。
+            request_redraw_all();
         }
 
         fn new_events(
@@ -633,6 +883,47 @@ mod winit_host {
         }
     }
 
+    /// 若按下点落在窗口外缘 `resize_border` 内，直接发起 OS 缩放拖拽并返回 true
+    /// （跳过本地 UI 命中）；不在边缘或平台不支持则返回 false。指针与内尺寸均为
+    /// 物理像素，边框厚度按逻辑像素给出，需乘 scale_factor 换算。
+    fn try_edge_resize(slot: &mut WindowSlot, mx: f32, my: f32) -> bool {
+        let b = slot.resize_border;
+        if b <= 0.0 {
+            return false;
+        }
+        let size = slot.window.inner_size();
+        let (sw, sh) = (size.width as f32, size.height as f32);
+        if sw <= 0.0 || sh <= 0.0 {
+            return false;
+        }
+        let band = b * slot.window.scale_factor() as f32;
+        let left = mx <= band;
+        let right = mx >= sw - band;
+        let top = my <= band;
+        let bottom = my >= sh - band;
+        use winit::window::ResizeDirection as RD;
+        let dir = if top && left {
+            RD::NorthWest
+        } else if top && right {
+            RD::NorthEast
+        } else if bottom && left {
+            RD::SouthWest
+        } else if bottom && right {
+            RD::SouthEast
+        } else if left {
+            RD::West
+        } else if right {
+            RD::East
+        } else if top {
+            RD::North
+        } else if bottom {
+            RD::South
+        } else {
+            return false;
+        };
+        slot.window.drag_resize_window(dir).is_ok()
+    }
+
     /// 中性光标 → winit 光标形状。
     fn map_cursor(c: compose::cursor::Cursor) -> winit::window::CursorIcon {
         use compose::cursor::Cursor as C;
@@ -656,7 +947,12 @@ mod winit_host {
         MAIN_WINDOW.with(|m| *m.borrow_mut() = Some((config, Box::new(app))));
         let event_loop =
             winit::event_loop::EventLoop::<()>::new().expect("event loop");
-        PROXY.with(|p| *p.borrow_mut() = Some(event_loop.create_proxy()));
+        let proxy = event_loop.create_proxy();
+        PROXY.with(|p| *p.borrow_mut() = Some(proxy.clone()));
+        // 跨线程唤醒：后台线程 post_to_main 后经此代理泵醒事件循环。
+        compose::runtime::set_wake_hook(move || {
+            let _ = proxy.send_event(());
+        });
 
         // 桌面入口：阻塞至所有窗口关闭。
         #[cfg(not(target_arch = "wasm32"))]
@@ -685,6 +981,8 @@ mod winit_host {
     not(target_os = "ios")
 ))]
 pub use winit_host::{
-    close_window, current_window, open_window, run_app, run_app_with, window_count, WindowConfig,
-    WindowHandle,
+    close_window, current_window, on_maximized_changed, open_window, run_app, run_app_with,
+    set_fullscreen,
+    set_maximized, set_minimized, start_window_drag, start_window_resize, window_count,
+    ResizeEdge, WindowConfig, WindowHandle,
 };

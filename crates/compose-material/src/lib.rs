@@ -392,6 +392,7 @@ pub use widgets::{
     nice_linear_domain,
     nice_step,
     series_palette,
+    set_on_submit,
 };
 
 #[cfg(compose_ffmpeg)]
